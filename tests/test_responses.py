@@ -19,6 +19,7 @@ from endpoints.OAI.types.responses import ResponsesRequest
 from endpoints.OAI.utils.chat_completion import _chat_stream_collector, iter_generation_events
 from endpoints.OAI.utils.responses import ResponsesAccumulator, generate_response_events, collect_response
 from endpoints.OAI.utils.responses_input import adapt_request, ResponseRequestError, InvalidModelOutput
+from endpoints.OAI.utils import responses_input
 from endpoints.OAI.utils.stream_parser import CONTENT, TOOL, REASONING
 
 
@@ -29,6 +30,32 @@ FUNCTION = {"type": "function", "name": "read", "parameters": {
 CUSTOM = {"type": "custom", "name": "patch", "format": {
     "type": "grammar", "syntax": "lark", "definition": 'start: "*** Begin Patch" "\\n" "*** End Patch" "\\n"',
 }}
+NAMESPACE = {
+    "type": "namespace",
+    "name": "workspace",
+    "description": "Tools for working with the client workspace.",
+    "tools": [
+        {**FUNCTION, "description": "Read a workspace file."},
+        {**CUSTOM, "description": "Apply a patch to the workspace."},
+    ],
+}
+CODEX_NAMESPACE = {
+    "type": "namespace",
+    "name": "multi_agent_v1",
+    "description": "Tools for spawning and managing sub-agents.",
+    "tools": [{
+        "type": "function",
+        "name": "spawn_agent",
+        "description": "Spawn a sub-agent for a well-scoped task.",
+        "strict": False,
+        "parameters": {
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"],
+            "additionalProperties": False,
+        },
+    }],
+}
 
 
 def packet(events, **generation):
@@ -146,10 +173,144 @@ class InputTests(unittest.TestCase):
 
     def test_unsupported_options(self):
         for option in ({"store": True}, {"previous_response_id": "r"}, {"background": True},
-                       {"conversation": "c"}, {"unknown": True}, {"reasoning": {"summary": "auto"}},
-                       {"tools": [{"type": "web_search"}]}):
+                       {"conversation": "c"}, {"unknown": True},
+                       {"prompt": {"id": "p"}}, {"max_tool_calls": 3},
+                       {"context_management": {"type": "auto"}}, {"truncation": "auto"},
+                       {"reasoning": {"summary": "verbose"}},
+                       {"tools": [{"type": "function"}]}):
             with self.assertRaises(ValidationError):
                 ResponsesRequest(input="x", **option)
+
+    def test_unsupported_options_state_a_reason(self):
+        """A rejection that cannot be acted on is a debugging session, not an error."""
+        for option, expected in (
+            ({"store": True}, "stateless"),
+            ({"previous_response_id": "r"}, "replay the earlier items"),
+            ({"truncation": "auto"}, "truncated"),
+            ({"prompt": {"id": "p"}}, "instructions instead"),
+            ({"moderation": {"model": "m"}}, "filtering that never happens"),
+        ):
+            with self.assertRaises(ValidationError) as caught:
+                ResponsesRequest(input="x", **option)
+            self.assertIn(expected, caught.exception.errors()[0]["msg"])
+
+    def test_data_requests_accepted_but_unproduced(self):
+        """An include asks for available data; none of it exists, and none is invented."""
+        data = ResponsesRequest(
+            input="x", top_logprobs=5,
+            include=["reasoning.encrypted_content", "message.output_text.logprobs",
+                     "web_search_call.results"],
+        )
+        self.assertEqual(len(data.include), 3)
+        chat, _ = adapt_request(data)
+        self.assertEqual([m.content for m in chat.messages], ["x"])
+
+    def test_advisory_fields_accepted_and_ignored(self):
+        """Routing and telemetry hints cannot change generation, so they must not 400."""
+        data = ResponsesRequest(input="x", service_tier="priority", user="u1",
+                                safety_identifier="s1", prompt_cache_key="k",
+                                prompt_cache_retention="24h",
+                                prompt_cache_options={"mode": "explicit"},
+                                stream_options={"include_obfuscation": False},
+                                client_metadata={"app": "codex"})
+        self.assertEqual(data.service_tier, "priority")
+        chat, _ = adapt_request(data)
+        self.assertEqual([m.content for m in chat.messages], ["x"])
+
+    def test_moderation_still_rejected(self):
+        """Ignoring a moderation request would imply filtering that never happens."""
+        with self.assertRaises(ValidationError):
+            ResponsesRequest(input="x", moderation={"model": "omni-moderation-latest"})
+
+    def test_null_tool_fields_take_their_defaults(self):
+        """Clients spell an unset description or parameter set as an explicit null."""
+        data = ResponsesRequest(input="x", tools=[
+            {"type": "function", "name": "f", "description": None, "parameters": None},
+            {"type": "custom", "name": "c", "description": None},
+        ])
+        self.assertEqual(data.tools[0].description, "")
+        self.assertEqual(data.tools[0].parameters, {"type": "object", "properties": {}})
+        self.assertEqual(data.tools[1].description, "")
+        chat, tools = adapt_request(data)
+        self.assertEqual(set(tools.tools), {"f", "c"})
+
+    def test_replayed_output_text_extras_are_dropped(self):
+        """An assistant turn recorded elsewhere replays without its annotations."""
+        data = ResponsesRequest(input=[{"role": "assistant", "content": [{
+            "type": "output_text", "text": "hi",
+            "annotations": [{"type": "url_citation", "url": "https://a"}],
+            "logprobs": [{"token": "hi", "logprob": -0.1}],
+        }]}])
+        part = data.input[0].content[0]
+        self.assertEqual((part.annotations, part.logprobs), ([], []))
+        chat, _ = adapt_request(data)
+        self.assertNotIn("url_citation", json.dumps(
+            [m.model_dump() for m in chat.messages], default=str))
+
+    def test_image_detail_hint_accepted_and_ignored(self):
+        """Resolution control is unimplemented; the hint must not fail the request."""
+        for detail in ("auto", "low", "high", None):
+            data = ResponsesRequest(input=[{"role": "user", "content": [
+                {"type": "input_image", "image_url": "https://a/b.png", "detail": detail}]}])
+            chat, _ = adapt_request(data, vision=True)
+            self.assertEqual(chat.messages[0].content[0].type, "image_url")
+
+    def test_reasoning_summary_requested_but_never_produced(self):
+        """Agent clients ask for summaries; accepting the ask produces no summary."""
+        for summary in ("auto", "concise", "detailed", "none", None):
+            data = ResponsesRequest(input="x", reasoning={"effort": "high", "summary": summary})
+            self.assertEqual(data.reasoning.summary, summary)
+            chat, _ = adapt_request(data)
+            self.assertEqual(chat.reasoning_effort, "high")
+
+    def test_replayed_reasoning_items_are_ignored(self):
+        """Codex echoes reasoning items back; they must not break call/result pairing."""
+        data = ResponsesRequest(input=[
+            {"role": "user", "content": "hi"},
+            {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque",
+             "summary": [{"type": "summary_text", "text": "ignored"}]},
+            {"type": "function_call", "call_id": "c1", "name": "read", "arguments": '{"path": "f"}'},
+            {"type": "reasoning", "id": "rs_2"},
+            {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+        ], tools=[FUNCTION])
+        chat, _ = adapt_request(data)
+        self.assertEqual([m.role for m in chat.messages], ["user", "assistant", "tool"])
+        self.assertNotIn("opaque", json.dumps([m.model_dump() for m in chat.messages], default=str))
+
+    def test_hosted_tools_accepted_but_ignored(self):
+        data = ResponsesRequest(input="x", tools=[
+            {"type": "web_search"}, FUNCTION,
+            {"type": "turbo_search", "filters": {"allowed_domains": ["example.com"]}},
+        ])
+        chat, tools = adapt_request(data)
+        self.assertEqual([tool.function.name for tool in chat.tools], ["read"])
+        self.assertEqual(set(tools.tools), {"read"})
+        self.assertEqual(tools.ignored_types, ["web_search", "turbo_search"])
+        dumped = data.model_dump(mode="json")
+        self.assertEqual(dumped["tools"][0], {"type": "web_search"})
+        self.assertEqual(dumped["tools"][2]["type"], "turbo_search")
+
+    def test_ignored_tools_are_named_once_per_tool_set(self):
+        """The console names each ignored tool, never its configuration or credentials."""
+        mcp = {"type": "mcp", "server_label": "github",
+               "server_url": "https://example.com/mcp?token=URL_SECRET",
+               "headers": {"Authorization": "Bearer HEADER_SECRET"}}
+        tools = [{"type": "web_search"}, FUNCTION, mcp, {"type": "web_search"}]
+        with patch.object(responses_input, "_warned_tool_sets", set()), \
+                patch.object(responses_input, "xlogger") as log:
+            adapt_request(ResponsesRequest(input="x", tools=tools))
+            # Agent clients resend their tools every turn, possibly reordered.
+            adapt_request(ResponsesRequest(input="x", tools=list(reversed(tools))))
+            adapt_request(ResponsesRequest(input="x", tools=[{"type": "file_search"}]))
+        warnings = [call.kwargs["details"] for call in log.warning.call_args_list]
+        self.assertEqual(warnings, ["web_search(x2), mcp:github", "file_search"])
+        self.assertEqual(log.debug.call_count, 1)
+        self.assertNotIn("SECRET", json.dumps(log.method_calls, default=str))
+
+    def test_ignored_tool_names_cannot_break_the_log_line(self):
+        self.assertEqual(responses_input.loggable("evil\n12:00 ERROR:\x1b[31m x"),
+                         "evil 12:00 ERROR: [31m x")
+        self.assertEqual(len(responses_input.loggable("a" * 500)), 64)
 
     def test_images_rejected_on_text_model(self):
         data = ResponsesRequest(input=[{"role": "user", "content": [
@@ -176,6 +337,85 @@ class InputTests(unittest.TestCase):
         adapt_request(data)
         self.assertTrue(data.tools[0].strict)
         self.assertEqual(data.tools[0].parameters["required"], ["x"])
+
+    def test_namespace_tools_are_qualified_and_preserved(self):
+        data = ResponsesRequest(input="x", tools=[NAMESPACE])
+        chat, tools = adapt_request(data)
+        self.assertEqual(set(tools.tools), {"workspace.read", "workspace.patch"})
+        self.assertEqual(
+            [tool.function.name for tool in chat.tools],
+            ["workspace.read", "workspace.patch"],
+        )
+        self.assertTrue(
+            chat.tools[0].function.description.startswith(
+                "Tools for working with the client workspace.\n"
+            )
+        )
+        dumped = data.model_dump(mode="json")
+        self.assertEqual(dumped["tools"][0]["type"], "namespace")
+        self.assertEqual(
+            [tool["name"] for tool in dumped["tools"][0]["tools"]],
+            ["read", "patch"],
+        )
+
+    def test_codex_multi_agent_namespace_payload(self):
+        data = ResponsesRequest(input="x", tools=[CODEX_NAMESPACE])
+        chat, tools = adapt_request(data)
+        self.assertEqual(set(tools.tools), {"multi_agent_v1.spawn_agent"})
+        self.assertEqual(chat.tools[0].function.name, "multi_agent_v1.spawn_agent")
+        self.assertFalse(data.tools[0].tools[0].strict)
+
+    def test_namespace_qualified_tool_choice(self):
+        data = ResponsesRequest(
+            input="x",
+            tools=[NAMESPACE],
+            tool_choice={"type": "function", "name": "workspace.read"},
+        )
+        chat, tools = adapt_request(data)
+        self.assertEqual(tools.allowed, {"workspace.read"})
+        self.assertEqual([tool.function.name for tool in chat.tools], ["workspace.read"])
+
+    def test_namespace_name_collisions_rejected(self):
+        for declared in [
+            [NAMESPACE, {**FUNCTION, "name": "workspace.read"}],
+            [{**NAMESPACE, "tools": [FUNCTION, FUNCTION]}],
+        ]:
+            with self.assertRaises(ResponseRequestError):
+                adapt_request(ResponsesRequest(input="x", tools=declared))
+
+    def test_namespace_rejects_nested_namespaces_and_execution_metadata(self):
+        nested = {
+            "type": "namespace",
+            "name": "outer",
+            "tools": [{"type": "namespace", "name": "inner", "tools": []}],
+        }
+        unsupported = [
+            {**FUNCTION, "defer_loading": True},
+            {**FUNCTION, "async": True},
+            {**FUNCTION, "allowed_callers": ["direct"]},
+            {**FUNCTION, "output_schema": {"type": "object"}},
+        ]
+        with self.assertRaises(ValidationError):
+            ResponsesRequest(input="x", tools=[nested])
+        for child in unsupported:
+            with self.assertRaises(ValidationError):
+                ResponsesRequest(
+                    input="x",
+                    tools=[{"type": "namespace", "name": "ns", "tools": [child]}],
+                )
+
+    def test_qualified_calls_replay(self):
+        data = ResponsesRequest(input=[
+            {
+                "type": "function_call",
+                "call_id": "one",
+                "name": "workspace.read",
+                "arguments": '{"path":"x"}',
+            },
+            {"type": "function_call_output", "call_id": "one", "output": "ok"},
+        ])
+        chat, _ = adapt_request(data)
+        self.assertEqual(chat.messages[0].tool_calls[0].function.name, "workspace.read")
 
 
 class AccumulatorTests(unittest.TestCase):
@@ -207,6 +447,26 @@ class AccumulatorTests(unittest.TestCase):
                          ["message", "function_call", "message", "custom_tool_call", "message"])
         self.assertEqual(acc.response.output[3].input, value)
         self.assertNotIn("hidden", acc.response.model_dump_json())
+
+    def test_namespaced_function_and_custom_calls(self):
+        acc = self.make(tools=[NAMESPACE])
+        value = "*** Begin Patch\n*** End Patch\n"
+        acc.consume(
+            packet([(
+                TOOL,
+                tool_text("workspace.read")
+                + tool_text("workspace.patch", {"input": value}),
+            )])
+        )
+        acc.finish(finish())
+        self.assertEqual(
+            [(item.type, item.name) for item in acc.response.output],
+            [("function_call", "workspace.read"), ("custom_tool_call", "workspace.patch")],
+        )
+        self.assertEqual(acc.response.output[1].input, value)
+        snapshot = acc.snapshot()
+        self.assertEqual(snapshot["tools"][0]["type"], "namespace")
+        self.assertEqual(snapshot["tools"][0]["tools"][0]["name"], "read")
 
     def test_limit_never_releases_tool(self):
         acc = self.make(tools=[FUNCTION], tool_choice="required")
@@ -313,7 +573,11 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         result = response.json()
         streamed = await self.client.post("/v1/responses", json={"input": "hi", "stream": True})
         self.assertIn("event: response.completed", streamed.text)
-        events = [json.loads(line[6:]) for line in streamed.text.splitlines() if line.startswith("data: ")]
+        events = [
+            json.loads(line[6:])
+            for line in streamed.text.splitlines()
+            if line.startswith("data: ")
+        ]
         self.assertEqual(events[-1]["response"]["output"][0]["content"], result["output"][0]["content"])
         self.assertEqual(events[-1]["response"]["usage"], result["usage"])
         self.assertNotIn("[DONE]", streamed.text)
@@ -323,43 +587,172 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["param"], "store")
 
+    async def test_validation_error_names_the_offending_field(self):
+        """A fault inside `input` must not surface as the union's string branch."""
+        cases = [
+            ({"input": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": "https://a/b.png", "detail": "ultra"}]}]},
+             "input[0].content[0].detail"),
+            ({"input": [{"role": "critic", "content": "x"}]}, "input[0].role"),
+            ({"input": [{"type": "function_call", "name": "f", "arguments": "{}"}]},
+             "input[0].call_id"),
+            ({"input": [{"type": "web_search_call", "id": "w"}]}, "input[0]"),
+            ({"input": "x", "tools": [{"type": "namespace", "name": "ns",
+                                       "tools": [{"type": "function"}]}]},
+             "tools[0].tools[0].name"),
+            # A real field whose name collides with a union tag must survive.
+            ({"input": "x", "text": {"format": {"type": "bogus"}}}, "text.format.type"),
+        ]
+        for payload, param in cases:
+            response = await self.client.post("/v1/responses", json=payload)
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(response.json()["error"]["param"], param)
+
+    async def test_unparsable_body_has_no_param(self):
+        response = await self.client.post(
+            "/v1/responses", content=b"{oops",
+            headers={"content-type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIsNone(response.json()["error"]["param"])
+
+    async def test_namespace_json_and_sse(self):
+        self.container.chunks = [{"text": tool_text("workspace.read")}, finish()]
+        payload = {"input": "use tool", "tools": [NAMESPACE]}
+        response = await self.client.post("/v1/responses", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["tools"][0]["type"], "namespace")
+        self.assertEqual(result["output"][0]["name"], "workspace.read")
+
+        streamed = await self.client.post("/v1/responses", json={**payload, "stream": True})
+        self.assertEqual(streamed.status_code, 200, streamed.text)
+        events = [json.loads(line[6:]) for line in streamed.text.splitlines() if line.startswith("data: ")]
+        completed = events[-1]["response"]
+        self.assertEqual(completed["tools"][0]["type"], "namespace")
+        self.assertEqual(completed["output"][0]["name"], "workspace.read")
+
+    async def test_hosted_tool_accepted_and_echoed(self):
+        payload = {"input": "hi", "tools": [{"type": "web_search"}, FUNCTION]}
+        response = await self.client.post("/v1/responses", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["tools"][0], {"type": "web_search"})
+        self.assertEqual(result["tools"][1]["name"], "read")
+
+        streamed = await self.client.post("/v1/responses", json={**payload, "stream": True})
+        self.assertEqual(streamed.status_code, 200, streamed.text)
+        events = [json.loads(line[6:]) for line in streamed.text.splitlines() if line.startswith("data: ")]
+        completed = events[-1]["response"]
+        self.assertEqual(completed["tools"][0], {"type": "web_search"})
+
     async def test_openai_sdk_create_and_stream(self):
+        import httpx2
         from openai import AsyncOpenAI
-        sdk = AsyncOpenAI(api_key="test", base_url="http://test/v1", http_client=self.client, max_retries=0)
-        result = await sdk.responses.create(input="hi", model="test-model", store=False)
-        self.assertEqual(result.output_text, "hello")
-        stream = await sdk.responses.create(input="hi", model="test-model", stream=True, store=False)
-        events = [event async for event in stream]
-        self.assertEqual(events[-1].type, "response.completed")
-        self.assertEqual(events[-1].response.output_text, "hello")
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=make_app()), base_url="http://test"
+        ) as asgi_client:
+            async def handler(request):
+                response = await asgi_client.request(
+                    request.method,
+                    request.url.path,
+                    headers=dict(request.headers),
+                    content=request.content,
+                )
+                return httpx2.Response(
+                    response.status_code,
+                    headers=dict(response.headers),
+                    content=response.content,
+                    request=request,
+                )
+
+            transport = httpx2.MockTransport(handler)
+            async with httpx2.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                sdk = AsyncOpenAI(
+                    api_key="test",
+                    base_url="http://test/v1",
+                    http_client=client,
+                    max_retries=0,
+                )
+                sdk._platform = "Linux"
+                result = await sdk.responses.create(input="hi", model="test-model", store=False)
+                self.assertEqual(result.output_text, "hello")
+                stream = await sdk.responses.create(
+                    input="hi", model="test-model", stream=True, store=False
+                )
+                events = [event async for event in stream]
+                self.assertEqual(events[-1].type, "response.completed")
+                self.assertEqual(events[-1].response.output_text, "hello")
 
 
 class AdditionalContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_python_sdk_tool_round_trips(self):
+        import httpx2
         from openai import AsyncOpenAI
         for tool in (FUNCTION, CUSTOM):
             value = "*** Begin Patch\n*** End Patch\n"
             name = tool["name"]
             args = {"path": "x"} if name == "read" else {"input": value}
             container = FakeContainer([{"text": tool_text(name, args)}, finish()])
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=make_app())) as client:
-                sdk = AsyncOpenAI(api_key="test", base_url="http://test/v1", http_client=client, max_retries=0)
-                with patch.object(model, "container", container), patch.object(model, "check_context_length"):
-                    stream = await sdk.responses.create(model="test-model", input="use tool", tools=[tool], stream=True)
-                    events = [e async for e in stream]
-                    response = events[-1].response
-                    self.assertEqual(response.status, "completed")
-                    call = response.output[0]
-                    self.assertEqual(call.type, "function_call" if name == "read" else "custom_tool_call")
-                    if name == "patch":
-                        self.assertEqual(call.input, value)
-                    container.chunks = [{"text": "done"}, finish()]
-                    # SDK dumps contain optional nulls on models: use exclude_none when replaying.
-                    input_items = [{"role": "user", "content": "use tool"},
-                                   call.model_dump(exclude_none=True),
-                                   {"type": call.type + "_output", "call_id": call.call_id, "output": "ok"}]
-                    result = await sdk.responses.create(model="test-model", input=input_items, tools=[tool])
-                    self.assertEqual(result.output_text, "done")
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=make_app()), base_url="http://test"
+            ) as asgi_client:
+                async def handler(request):
+                    response = await asgi_client.request(
+                        request.method,
+                        request.url.path,
+                        headers=dict(request.headers),
+                        content=request.content,
+                    )
+                    return httpx2.Response(
+                        response.status_code,
+                        headers=dict(response.headers),
+                        content=response.content,
+                        request=request,
+                    )
+
+                async with httpx2.AsyncClient(
+                    transport=httpx2.MockTransport(handler), base_url="http://test"
+                ) as client:
+                    sdk = AsyncOpenAI(
+                        api_key="test",
+                        base_url="http://test/v1",
+                        http_client=client,
+                        max_retries=0,
+                    )
+                    sdk._platform = "Linux"
+                    with patch.object(model, "container", container), patch.object(
+                        model, "check_context_length"
+                    ):
+                        stream = await sdk.responses.create(
+                            model="test-model", input="use tool", tools=[tool], stream=True
+                        )
+                        events = [e async for e in stream]
+                        response = events[-1].response
+                        self.assertEqual(response.status, "completed")
+                        call = response.output[0]
+                        expected = "function_call" if name == "read" else "custom_tool_call"
+                        self.assertEqual(call.type, expected)
+                        if name == "patch":
+                            self.assertEqual(call.input, value)
+                        container.chunks = [{"text": "done"}, finish()]
+                        # SDK dumps contain optional nulls; exclude them when replaying.
+                        input_items = [
+                            {"role": "user", "content": "use tool"},
+                            call.model_dump(exclude_none=True),
+                            {
+                                "type": call.type + "_output",
+                                "call_id": call.call_id,
+                                "output": "ok",
+                            },
+                        ]
+                        result = await sdk.responses.create(
+                            model="test-model", input=input_items, tools=[tool]
+                        )
+                        self.assertEqual(result.output_text, "done")
 
     async def test_auth_and_context_errors_are_openai_shaped(self):
         from fastapi import HTTPException

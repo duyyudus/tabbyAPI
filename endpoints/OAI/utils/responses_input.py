@@ -2,19 +2,24 @@
 
 import json
 import re
+from collections import Counter
 from copy import deepcopy
 
 from jsonschema import Draft202012Validator
 from referencing import Registry
 from lark import Lark
 
+from common.logger import xlogger
 from endpoints.OAI.types.chat_completion import ChatCompletionRequest
 from endpoints.OAI.types.responses import (
     AllowedTools,
     FunctionTool,
     InputMessage,
     NamedToolChoice,
+    NamespaceTool,
+    ReasoningItem,
     ToolResult,
+    UnsupportedTool,
 )
 
 
@@ -90,80 +95,64 @@ def normalize_strict(schema, explicit=False):
     return result
 
 
+# Fields that identify a hosted tool without exposing its configuration: an MCP
+# definition can also carry server URLs and authorization headers.
+HOSTED_TOOL_LABELS = ("name", "server_label")
+# Tool sets already warned about. Agent clients resend the same tools every turn,
+# so repeats drop to debug; the set is bounded because tool types are client-chosen.
+_warned_tool_sets = set()
+
+
+def loggable(value, limit=64):
+    """Reduce client-supplied text to one printable console line."""
+    text = " ".join("".join(c if c.isprintable() else " " for c in str(value)).split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def describe_ignored_tool(definition):
+    # One token per tool, e.g. mcp:github, so console wrapping only breaks between tools.
+    kind = loggable(definition.get("type", "unknown"))
+    label = next((definition[key] for key in HOSTED_TOOL_LABELS if definition.get(key)), None)
+    return f"{kind}:{loggable(label).replace(' ', '_')}" if label is not None else kind
+
+
+def warn_ignored_tools(definitions):
+    counts = Counter(describe_ignored_tool(definition) for definition in definitions)
+    listed = ", ".join(name if count == 1 else f"{name}(x{count})" for name, count in counts.items())
+    message = "Ignoring hosted or unknown tool types, which are not executed locally:"
+    types = ", ".join(sorted({str(definition.get("type", "unknown")) for definition in definitions}))
+    extra = {"types": types, "tools": listed}
+    signature = frozenset(counts.items())
+    if signature in _warned_tool_sets:
+        xlogger.debug(message, extra, details=listed)
+        return
+    if len(_warned_tool_sets) >= 256:
+        _warned_tool_sets.clear()
+    _warned_tool_sets.add(signature)
+    xlogger.warning(message, extra, details=listed)
+
+
 class ToolAdapter:
     def __init__(self, data):
         self.tools = {}
         self.validators = {}
         self.grammars = {}
         self.chat_tools = []
+        self.ignored_types = []
         self.parallel = data.parallel_tool_calls
         self.required = data.tool_choice == "required"
+        ignored = []
         for tool in data.tools:
-            if tool.name in self.tools:
-                raise ResponseRequestError("Tool names must be unique", "tools")
-            self.tools[tool.name] = tool
-            if isinstance(tool, FunctionTool):
-                schema_validator(tool.parameters)
-                if tool.parameters.get("type") != "object":
-                    raise ResponseRequestError(
-                        "Function parameters must be an object schema", "tools"
-                    )
-                if tool.strict is not False:
-                    try:
-                        tool.parameters = normalize_strict(tool.parameters, tool.strict is True)
-                        tool.strict = True
-                    except ResponseRequestError:
-                        if tool.strict is True:
-                            raise
-                        tool.strict = False
-                parameters = tool.parameters
-                if tool.strict:
-                    self.validators[tool.name] = schema_validator(parameters)
-                description = tool.description
+            if isinstance(tool, UnsupportedTool):
+                self.ignored_types.append(tool.definition.get("type", "unknown"))
+                ignored.append(tool.definition)
+            elif isinstance(tool, NamespaceTool):
+                for child in tool.tools:
+                    self._register_tool(child, f"{tool.name}.{child.name}", tool.description)
             else:
-                parameters = {
-                    "type": "object",
-                    "properties": {"input": {"type": "string"}},
-                    "required": ["input"],
-                    "additionalProperties": False,
-                }
-                self.validators[tool.name] = schema_validator(parameters)
-                description = (
-                    tool.description + "\nPass the exact raw tool input in the input string."
-                )
-                fmt = tool.format
-                if fmt.type == "grammar":
-                    if fmt.syntax != "lark" or not fmt.definition:
-                        raise ResponseRequestError(
-                            "Custom grammars require a Lark definition", "tools"
-                        )
-                    # Lark allows local file imports; only bundled common terminals are allowed.
-                    for line in fmt.definition.splitlines():
-                        if "%import" in line and not re.fullmatch(
-                            r"\s*%import common\.[A-Za-z_][A-Za-z_0-9]*(?:\s*->\s*\w+)?\s*", line
-                        ):
-                            raise ResponseRequestError(
-                                "Only common terminal imports are supported", "tools"
-                            )
-                    try:
-                        self.grammars[tool.name] = Lark(fmt.definition, parser="earley")
-                    except Exception as exc:
-                        raise ResponseRequestError(
-                            f"Unsupported Lark grammar: {exc}", "tools"
-                        ) from exc
-                    description += "\nThe input must match this Lark grammar:\n" + fmt.definition
-                elif fmt.syntax is not None or fmt.definition is not None:
-                    raise ResponseRequestError("Text tools cannot specify a grammar", "tools")
-            self.chat_tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": description,
-                        "parameters": parameters,
-                    },
-                }
-            )
+                self._register_tool(tool, tool.name)
+        if ignored:
+            warn_ignored_tools(ignored)
         self.allowed = set(self.tools)
         choice = data.tool_choice
         if choice == "none":
@@ -177,6 +166,67 @@ class ToolAdapter:
         if self.required and not self.allowed:
             raise ResponseRequestError("tool_choice requires at least one tool", "tool_choice")
         self.chat_tools = [t for t in self.chat_tools if t["function"]["name"] in self.allowed]
+
+    def _register_tool(self, tool, name, namespace_description=""):
+        if name in self.tools:
+            raise ResponseRequestError("Tool names must be unique", "tools")
+        self.tools[name] = tool
+        description = "\n".join(part for part in (namespace_description, tool.description) if part)
+        if isinstance(tool, FunctionTool):
+            schema_validator(tool.parameters)
+            if tool.parameters.get("type") != "object":
+                raise ResponseRequestError("Function parameters must be an object schema", "tools")
+            if tool.strict is not False:
+                try:
+                    tool.parameters = normalize_strict(tool.parameters, tool.strict is True)
+                    tool.strict = True
+                except ResponseRequestError:
+                    if tool.strict is True:
+                        raise
+                    tool.strict = False
+            parameters = tool.parameters
+            if tool.strict:
+                self.validators[name] = schema_validator(parameters)
+        else:
+            parameters = {
+                "type": "object",
+                "properties": {"input": {"type": "string"}},
+                "required": ["input"],
+                "additionalProperties": False,
+            }
+            self.validators[name] = schema_validator(parameters)
+            description += ("\n" if description else "") + (
+                "Pass the exact raw tool input in the input string."
+            )
+            fmt = tool.format
+            if fmt.type == "grammar":
+                if fmt.syntax != "lark" or not fmt.definition:
+                    raise ResponseRequestError("Custom grammars require a Lark definition", "tools")
+                # Lark allows local file imports; only bundled common terminals are allowed.
+                for line in fmt.definition.splitlines():
+                    if "%import" in line and not re.fullmatch(
+                        r"\s*%import common\.[A-Za-z_][A-Za-z_0-9]*(?:\s*->\s*\w+)?\s*", line
+                    ):
+                        raise ResponseRequestError(
+                            "Only common terminal imports are supported", "tools"
+                        )
+                try:
+                    self.grammars[name] = Lark(fmt.definition, parser="earley")
+                except Exception as exc:
+                    raise ResponseRequestError(f"Unsupported Lark grammar: {exc}", "tools") from exc
+                description += "\nThe input must match this Lark grammar:\n" + fmt.definition
+            elif fmt.syntax is not None or fmt.definition is not None:
+                raise ResponseRequestError("Text tools cannot specify a grammar", "tools")
+        self.chat_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+            }
+        )
 
     def _choice_name(self, choice):
         tool = self.tools.get(choice.name)
@@ -239,7 +289,11 @@ def adapt_request(data, vision=False):
     calls = {}
     answered = set()
     for item in items:
-        if isinstance(item, InputMessage):
+        if isinstance(item, ReasoningItem):
+            # Replayed reasoning has no representation in the chat context; drop it
+            # without disturbing call/result pairing around it.
+            continue
+        elif isinstance(item, InputMessage):
             messages.append({"role": item.role, "content": convert_content(item.content, vision)})
         elif isinstance(item, ToolResult):
             if item.call_id not in calls or item.call_id in answered:

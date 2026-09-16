@@ -4,11 +4,25 @@ from time import time
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_serializer
 
 
 class WireModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+# A client may spell "unset" as an explicit null; treat it as the field's default
+# rather than a rejection, since null carries no instruction to honor.
+Description = Annotated[str, BeforeValidator(lambda value: "" if value is None else value)]
+Parameters = Annotated[
+    dict,
+    BeforeValidator(
+        lambda value: {"type": "object", "properties": {}} if value is None else value
+    ),
+]
+# Replayed assistant turns can carry annotations and logprobs produced elsewhere.
+# They are accepted and dropped: none are generated here, so none are echoed back.
+Dropped = Annotated[list, BeforeValidator(lambda value: [])]
 
 
 class InputText(WireModel):
@@ -19,14 +33,15 @@ class InputText(WireModel):
 class OutputText(WireModel):
     type: Literal["output_text"] = "output_text"
     text: str = ""
-    annotations: list = Field(default_factory=list, max_length=0)
-    logprobs: list = Field(default_factory=list, max_length=0)
+    annotations: Dropped = Field(default_factory=list)
+    logprobs: Dropped = Field(default_factory=list)
 
 
 class InputImage(WireModel):
     type: Literal["input_image"]
     image_url: str
-    detail: Literal["auto"] = "auto"
+    # Resolution control is not implemented; every hint is accepted and ignored.
+    detail: Literal["auto", "low", "high"] | None = "auto"
 
 
 Content = Annotated[InputText | OutputText | InputImage, Field(discriminator="type")]
@@ -67,8 +82,26 @@ class ToolResult(WireModel):
     status: Literal["in_progress", "completed", "incomplete"] | None = None
 
 
+class ReasoningItem(WireModel):
+    """A reasoning item replayed by a client: accepted for wire compatibility, never used.
+
+    No reasoning items are produced, so nothing here can round-trip meaningfully. Field
+    drift in the upstream item is tolerated because the whole item is dropped on input.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["reasoning"] = "reasoning"
+    id: str | None = None
+    summary: list = Field(default_factory=list)
+    content: list = Field(default_factory=list)
+    encrypted_content: str | None = None
+    status: Literal["in_progress", "completed", "incomplete"] | None = None
+
+
 InputItem = Annotated[
-    InputMessage | FunctionCall | CustomCall | ToolResult, Field(discriminator="type")
+    InputMessage | FunctionCall | CustomCall | ToolResult | ReasoningItem,
+    Field(discriminator="type"),
 ]
 
 
@@ -81,19 +114,62 @@ class CustomFormat(WireModel):
 class FunctionTool(WireModel):
     type: Literal["function"]
     name: str = Field(min_length=1)
-    description: str = ""
-    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
+    description: Description = ""
+    parameters: Parameters = Field(default_factory=lambda: {"type": "object", "properties": {}})
     strict: bool | None = None
 
 
 class CustomTool(WireModel):
     type: Literal["custom"]
     name: str = Field(min_length=1)
-    description: str = ""
+    description: Description = ""
     format: CustomFormat = Field(default_factory=CustomFormat)
 
 
-ToolDefinition = Annotated[FunctionTool | CustomTool, Field(discriminator="type")]
+NestedToolDefinition = Annotated[FunctionTool | CustomTool, Field(discriminator="type")]
+
+
+class NamespaceTool(WireModel):
+    type: Literal["namespace"]
+    name: str = Field(min_length=1)
+    description: Description = ""
+    tools: list[NestedToolDefinition] = Field(default_factory=list)
+
+
+class UnsupportedTool(WireModel):
+    """A hosted or unknown tool type: accepted for wire compatibility, never executed."""
+
+    type: Literal["__unsupported__"] = "__unsupported__"
+    definition: dict
+
+    @model_serializer(mode="plain")
+    def as_wire_definition(self):
+        return self.definition
+
+
+# Tool kinds the server can present to the model; anything else is held as an
+# UnsupportedTool and ignored.
+SUPPORTED_TOOL_TYPES = frozenset({"function", "custom", "namespace"})
+
+
+def _tag_unsupported_tools(value):
+    if isinstance(value, list):
+        return [
+            {"type": "__unsupported__", "definition": item}
+            if isinstance(item, dict)
+            and isinstance(item.get("type"), str)
+            and item["type"] not in SUPPORTED_TOOL_TYPES
+            else item
+            for item in value
+        ]
+    return value
+
+
+ToolDefinition = Annotated[
+    FunctionTool | CustomTool | NamespaceTool | UnsupportedTool, Field(discriminator="type")
+]
+
+ToolList = Annotated[list[ToolDefinition], BeforeValidator(_tag_unsupported_tools)]
 
 
 class NamedToolChoice(WireModel):
@@ -122,7 +198,24 @@ class TextOptions(WireModel):
 
 class ReasoningOptions(WireModel):
     effort: str | None = None
-    summary: Literal["none"] | None = None
+    # A summary request is a request for available data, not a demand to invent one:
+    # every mode is accepted and none is honored, because reasoning stays internal.
+    summary: Literal["auto", "concise", "detailed", "none"] | None = None
+
+
+UNSUPPORTED = {
+    "store": "this server is stateless and never persists a response, so store must be false",
+    "background": "there is no job queue here, so background must be false",
+    "previous_response_id": "no response history is kept; replay the earlier items in input",
+    "conversation": "Conversations are not implemented; replay the earlier items in input",
+    "prompt": "server-side prompt templates are not implemented; send instructions instead",
+    "max_tool_calls": "a tool-call budget is not enforced here; omit it rather than rely on it",
+    "context_management": "automatic context compaction is not implemented",
+    "moderation": "no moderation model runs here, and accepting this would imply "
+                  "input and output filtering that never happens",
+    "truncation": "an oversized context fails instead of being truncated, "
+                  "so truncation must be disabled",
+}
 
 
 class ResponsesRequest(WireModel):
@@ -130,25 +223,59 @@ class ResponsesRequest(WireModel):
     input: str | list[InputItem] = Field(default_factory=list)
     instructions: str | None = None
     stream: bool = False
-    store: Literal[False] = False
-    background: Literal[False] = False
-    previous_response_id: None = None
-    conversation: None = None
+    store: bool = False
+    background: bool = False
+    previous_response_id: str | None = None
+    conversation: str | dict | None = None
+    prompt: dict | None = None
+    max_tool_calls: int | None = None
+    context_management: dict | None = None
+    moderation: dict | None = None
     max_output_tokens: int | None = Field(default=None, gt=0)
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
-    tools: list[ToolDefinition] = Field(default_factory=list)
+    tools: ToolList = Field(default_factory=list)
     tool_choice: Literal["auto", "none", "required"] | NamedToolChoice | AllowedTools = "auto"
     parallel_tool_calls: bool = True
     text: TextOptions = Field(default_factory=TextOptions)
     reasoning: ReasoningOptions | None = None
     metadata: dict[str, str] = Field(default_factory=dict, max_length=16)
     # Advisory routing/telemetry fields; local KV caching remains backend-managed.
+    # Each is recorded and ignored: none can change what this server generates, so
+    # rejecting them would only break clients that send them by default.
     prompt_cache_key: str | None = None
     client_metadata: dict = Field(default_factory=dict)
-    truncation: Literal["disabled"] = "disabled"
-    # An include is a request for available data, not a demand to invent it.
-    include: list[Literal["reasoning.encrypted_content"]] = Field(default_factory=list)
+    prompt_cache_retention: str | None = None
+    prompt_cache_options: dict | None = None
+    service_tier: str | None = None
+    user: str | None = None
+    safety_identifier: str | None = None
+    # Obfuscation padding is a mitigation for OpenAI's network, not this one.
+    stream_options: dict | None = None
+    truncation: str = "disabled"
+    # An include is a request for available data, not a demand to invent it: any
+    # include is accepted, and one whose data this server never produces yields
+    # nothing. No reasoning items are returned, so no encrypted content exists.
+    include: list[str] = Field(default_factory=list)
+    # Likewise a request for token logprobs, which this server does not produce.
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
+
+    @field_validator(
+        "store", "background", "previous_response_id", "conversation", "prompt",
+        "max_tool_calls", "context_management", "moderation", "truncation",
+        mode="after",
+    )
+    @classmethod
+    def reject_unsupported(cls, value, info):
+        """Refuse options whose effect cannot be reproduced, naming the reason.
+
+        Silently ignoring any of these would change the answer, or what the caller
+        believes happened to it, without a word. Unlike an advisory hint, that is
+        worth a failed request.
+        """
+        if value != cls.model_fields[info.field_name].get_default():
+            raise ValueError(UNSUPPORTED[info.field_name])
+        return value
 
     @field_validator("input", mode="before")
     @classmethod
@@ -213,7 +340,7 @@ class ResponseObject(WireModel):
     top_p: float | None = None
     parallel_tool_calls: bool = True
     tool_choice: str | NamedToolChoice | AllowedTools = "auto"
-    tools: list[ToolDefinition] = Field(default_factory=list)
+    tools: ToolList = Field(default_factory=list)
     text: TextOptions = Field(default_factory=TextOptions)
     reasoning: ReasoningOptions | None = None
     metadata: dict[str, str] = Field(default_factory=dict)

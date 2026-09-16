@@ -16,6 +16,10 @@ import time
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex", action="store_true")
+    parser.add_argument(
+        "--codex-web-search", action="store_true",
+        help="Implies --codex; enables Codex's hosted web_search tool, as the desktop app sends it",
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     with socket.socket() as sock:
@@ -50,7 +54,7 @@ def main():
                     [shutil.which("npm") or "npm", "test", "--prefix", "tests/responses_clients"],
                     cwd=root, env=env, check=True, timeout=30,
                 )
-                if args.codex:
+                if args.codex or args.codex_web_search:
                     (work / "fixture.txt").write_text("before\n")
                     command = [shutil.which("codex") or "codex", "exec", "--ignore-user-config",
                                "--ephemeral", "--skip-git-repo-check", "-C", str(work),
@@ -60,9 +64,10 @@ def main():
                         'model_providers.tabby_fixture={name="Tabby fixture",base_url="' + base_url +
                         '",wire_api="responses",requires_openai_auth=false,supports_websockets=false,'
                         'request_max_retries=0,stream_max_retries=0}',
-                        'web_search="disabled"', 'model_reasoning_summary="none"',
+                        'web_search="enabled"' if args.codex_web_search else 'web_search="disabled"',
+                        'model_reasoning_summary="none"',
                         'model_supports_reasoning_summaries=false', 'approval_policy="never"',
-                        'features.multi_agent=false', 'features.apps=false',
+                        'features.multi_agent=true', 'features.apps=false',
                         'features.skill_search=false', 'features.tool_suggest=false',
                     ]
                     for option in options:

@@ -29,6 +29,9 @@ class ResponsesAccumulator:
     def __init__(self, data, tools, model_name):
         self.response = ResponseObject(
             model=model_name,
+            # Tools pass through as parsed instances: serialization unwraps an
+            # unsupported tool to its original tag, which would fail re-validation.
+            tools=list(data.tools),
             **data.model_dump(
                 include={
                     "instructions",
@@ -37,7 +40,6 @@ class ResponsesAccumulator:
                     "top_p",
                     "parallel_tool_calls",
                     "tool_choice",
-                    "tools",
                     "text",
                     "reasoning",
                     "metadata",

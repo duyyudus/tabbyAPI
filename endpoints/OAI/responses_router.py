@@ -23,6 +23,64 @@ from endpoints.OAI.utils.responses_input import ResponseRequestError, adapt_requ
 from endpoints.OAI.utils.tools import is_supported_format
 
 
+def param_path(location, body):
+    """Rebuild a validation path in OpenAI's param notation, e.g. input[0].content[0].detail.
+
+    Pydantic reports union branches and discriminator tags as synthetic segments the
+    client never sent ("str", "list[tagged-union[...]]", "message", "input_image").
+    Walking the submitted body drops exactly those: a real field addresses into the
+    body, a synthetic one does not.
+    """
+    parts = []
+    node = body
+    segments = [segment for segment in location if segment != "body"]
+    for index, segment in enumerate(segments):
+        if isinstance(segment, int):
+            if isinstance(node, list) and -len(node) <= segment < len(node):
+                node = node[segment]
+                parts.append(f"[{segment}]")
+        elif isinstance(node, dict) and segment in node:
+            node = node[segment]
+            parts.append(segment)
+        elif (
+            index == len(segments) - 1
+            and isinstance(node, dict)
+            and "[" not in segment
+        ):
+            # A required field is absent from the body, yet still names the fault.
+            parts.append(segment)
+    return parts
+
+
+def error_message(error):
+    """Pydantic prefixes a raised ValueError; the reason alone is the message."""
+    message = error["msg"]
+    prefix = "Value error, "
+    return message[len(prefix):] if message.startswith(prefix) else message
+
+
+def describe_validation_error(exc):
+    """Pick the most specific failure and render its param.
+
+    `input` is `str | list[InputItem]`, so any fault inside an item also fails the
+    string branch; that shallow error sorts first and would otherwise be reported
+    as `input.str`. The deepest path names the field the client actually got wrong.
+    """
+    errors = exc.errors()
+    body = getattr(exc, "body", None)
+    if not isinstance(body, (dict, list)):
+        # An unparsable body has no field to blame; its location is an offset.
+        error = errors[0]
+        named = [p for p in error["loc"] if isinstance(p, str) and p != "body"]
+        return error_message(error), ".".join(named) or None
+    ranked = [(param_path(error["loc"], body), error) for error in errors]
+    parts, error = max(ranked, key=lambda pair: len(pair[0]))
+    param = ""
+    for part in parts:
+        param += part if part.startswith("[") else (f".{part}" if param else part)
+    return error_message(error), param or None
+
+
 def error_response(message, status=400, param=None, code="invalid_value"):
     return JSONResponse(
         status_code=status,
@@ -45,9 +103,8 @@ class ResponsesRoute(APIRoute):
             try:
                 return await handler(request)
             except RequestValidationError as exc:
-                error = exc.errors()[0]
-                param = ".".join(str(p) for p in error["loc"] if p != "body")
-                return error_response(error["msg"], param=param)
+                message, param = describe_validation_error(exc)
+                return error_response(message, param=param)
             except ResponseRequestError as exc:
                 return error_response(str(exc), param=exc.param, code=exc.code)
             except ContextLengthHTTPException as exc:
