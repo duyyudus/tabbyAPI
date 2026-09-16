@@ -619,36 +619,18 @@ def _reasoning_budget_injection(mc, message: str) -> Optional[str]:
     return message + suffix
 
 
-async def _chat_stream_collector(
-    task_idx: int,
-    gen_queue: asyncio.Queue | None,
-    request_id: str,
-    prompt: str,
-    params: ChatCompletionRequest,
-    start_in_reasoning_mode: bool,
-    mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
-    streaming_mode: bool = True,
-    disconnect_handler: DisconnectHandler = None,
-    label: Optional[str] = None,
+async def iter_generation_events(
+    request_id,
+    prompt,
+    params,
+    start_in_reasoning_mode,
+    mm_embeddings=None,
+    disconnect_handler=None,
+    label=None,
 ):
-    """
-    Starts a request on the backend and collects generations while tracking phase, for a single
-    choice.
-
-    In streaming mode, emits chunks of text to be emitted as deltas to the client, divided into
-    reasoning/content/tool phases. Tool calls are parsed together at the end of stream, so the
-    last chunk contains all tool calls collected for the turn.
-
-    In non-streaming mode, collects everything with the same logic but then emits a single
-    response packet at the end, to be combined with any other choices (for n>1 requests) and
-    sent together to the client.
-    """
-
+    """Yield ordered channel fragments and unmodified backend termination/usage."""
     mc = model.container
     label = label or f"request {request_id}"
-    full_reasoning = ""
-    full_content = ""
-    full_tool = ""
 
     if mc.harmony:
         # Harmony messages carry their own channel structure, superseding the
@@ -699,9 +681,7 @@ async def _chat_stream_collector(
             budget_injection = None
     reasoning_tokens = 0
 
-    # Collect logprobs
-    collected_logprobs = []
-
+    new_generation = None
     try:
         new_generation = mc.stream_generate(
             request_id,
@@ -714,27 +694,13 @@ async def _chat_stream_collector(
             ),
             label=label,
         )
-        generation = {"index": task_idx}
         async for generation in new_generation:
-            generation["index"] = task_idx
             text = generation.get("text", "")
             finish_reason = generation.get("finish_reason")
 
             events = parser.feed(text) if text else []
             if finish_reason:
                 events += parser.finish()
-
-            delta_reasoning = ""
-            delta_content = ""
-            for channel, sub in events:
-                if channel == REASONING:
-                    delta_reasoning += sub
-                    full_reasoning += sub
-                elif channel == CONTENT:
-                    delta_content += sub
-                    full_content += sub
-                else:
-                    full_tool += sub
 
             # Count reasoning tokens and force the end of the reasoning phase
             # when the budget is exhausted. Attribution is approximate: a
@@ -752,9 +718,86 @@ async def _chat_stream_collector(
                         )
                     budget_injection = None
 
+            yield {
+                "generation": generation,
+                "events": events,
+                "tool_format": tool_format,
+                "content_logprobs": not parser.saw_tag and parser.in_content,
+            }
+            if finish_reason:
+                break
+    finally:
+        if new_generation is not None:
+            await new_generation.aclose()
+
+
+async def _chat_stream_collector(
+    task_idx: int,
+    gen_queue: asyncio.Queue | None,
+    request_id: str,
+    prompt: str,
+    params: ChatCompletionRequest,
+    start_in_reasoning_mode: bool,
+    mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
+    streaming_mode: bool = True,
+    disconnect_handler: DisconnectHandler = None,
+    label: Optional[str] = None,
+):
+    """
+    Starts a request on the backend and collects generations while tracking phase, for a single
+    choice.
+
+    In streaming mode, emits chunks of text to be emitted as deltas to the client, divided into
+    reasoning/content/tool phases. Tool calls are parsed together at the end of stream, so the
+    last chunk contains all tool calls collected for the turn.
+
+    In non-streaming mode, collects everything with the same logic but then emits a single
+    response packet at the end, to be combined with any other choices (for n>1 requests) and
+    sent together to the client.
+    """
+
+    label = label or f"request {request_id}"
+    full_reasoning = ""
+    full_content = ""
+    full_tool = ""
+    tool_format = getattr(model.container, "tool_format", None)
+
+    # Collect logprobs
+    collected_logprobs = []
+
+    source = iter_generation_events(
+        request_id,
+        prompt,
+        params,
+        start_in_reasoning_mode,
+        mm_embeddings,
+        disconnect_handler,
+        label,
+    )
+    try:
+        generation = {"index": task_idx}
+        async for packet in source:
+            generation = packet["generation"]
+            generation["index"] = task_idx
+            finish_reason = generation.get("finish_reason")
+            events = packet["events"]
+            tool_format = packet["tool_format"]
+
+            delta_reasoning = ""
+            delta_content = ""
+            for channel, sub in events:
+                if channel == REASONING:
+                    delta_reasoning += sub
+                    full_reasoning += sub
+                elif channel == CONTENT:
+                    delta_content += sub
+                    full_content += sub
+                else:
+                    full_tool += sub
+
             # Collect logprobs in content span only, skipping chunks that
             # contain a phase transition
-            if "logprobs_content" in generation and not parser.saw_tag and parser.in_content:
+            if "logprobs_content" in generation and packet["content_logprobs"]:
                 collected_logprobs += generation["logprobs_content"]
 
             # Add the output and emit
@@ -807,6 +850,8 @@ async def _chat_stream_collector(
             await gen_queue.put(e)
         else:
             return e
+    finally:
+        await source.aclose()
 
 
 async def stream_generate_chat_completion(

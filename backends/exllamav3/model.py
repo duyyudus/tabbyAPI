@@ -1429,7 +1429,10 @@ class ExllamaV3Container:
 
             if params.json_schema:
                 grammar_handler.add_json_schema_filter(
-                    params.json_schema, self.tokenizer, trigger_token_id=trigger_token_id
+                    params.json_schema,
+                    self.tokenizer,
+                    trigger_token_id=trigger_token_id,
+                    fail_on_error=getattr(params, "_fail_on_grammar_error", False),
                 )
 
             if params.regex_pattern:

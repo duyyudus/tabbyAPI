@@ -1,4 +1,4 @@
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator
 from time import time
 from typing import Literal, Union, List, Optional, Dict
 from uuid import uuid4
@@ -77,6 +77,8 @@ class ReasoningOptions(BaseModel):
 
 # Inherited from common request
 class ChatCompletionRequest(CommonCompletionRequest):
+    # Internal policy used by Responses; not a Chat Completions request option.
+    _fail_on_grammar_error: bool = PrivateAttr(default=False)
     messages: List[ChatCompletionMessage]
     prompt_template: Optional[str] = None
     add_generation_prompt: Optional[bool] = True

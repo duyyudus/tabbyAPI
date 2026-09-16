@@ -37,13 +37,16 @@ from endpoints.OAI.utils.completion import (
     stream_generate_completion,
 )
 from endpoints.OAI.utils.embeddings import get_embeddings
+from endpoints.OAI.responses_router import router as responses_router
 
 
 api_name = "OAI"
 router = APIRouter()
+router.include_router(responses_router)
 urls = {
     "Completions": "http://{host}:{port}/v1/completions",
     "Chat completions": "http://{host}:{port}/v1/chat/completions",
+    "Responses": "http://{host}:{port}/v1/responses",
 }
 
 # Block when model is still loading while second inline load request comes in

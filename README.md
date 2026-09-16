@@ -133,3 +133,10 @@ Creators/Developers:
 - [Splice86](https://github.com/Splice86)
 
 - [Turboderp](https://github.com/turboderp)
+
+### Responses API
+
+This fork supports stateless `POST /v1/responses` with SSE streaming, function tools,
+custom text/Lark tools, and client-managed conversation replay. See the
+[Responses API guide](docs/11.-Responses-API.md) for supported parameters, examples,
+Codex configuration, and tested client versions.

@@ -22,6 +22,7 @@ class ExLlamaV3Grammar:
         schema: dict,
         tokenizer: Tokenizer,
         trigger_token_id: Optional[int] = None,
+        fail_on_error: bool = False,
     ):
         """Adds an ExllamaV3 filter based on a JSON schema."""
 
@@ -37,6 +38,8 @@ class ExLlamaV3Grammar:
                 trigger_token=trigger_token_id,
             )
         except Exception:
+            if fail_on_error:
+                raise
             traceback.print_exc()
             xlogger.error(
                 "Skipping because the JSON schema couldn't be parsed. "
