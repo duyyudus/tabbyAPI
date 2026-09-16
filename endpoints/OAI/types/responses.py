@@ -4,7 +4,14 @@ from time import time
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_serializer
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+)
 
 
 class WireModel(BaseModel):
@@ -229,9 +236,9 @@ class ResponsesRequest(WireModel):
     conversation: str | dict | None = None
     prompt: dict | None = None
     max_tool_calls: int | None = None
-    context_management: dict | None = None
+    context_management: list | dict | None = None
     moderation: dict | None = None
-    max_output_tokens: int | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(default=None, ge=16)
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)
     tools: ToolList = Field(default_factory=list)
@@ -259,6 +266,16 @@ class ResponsesRequest(WireModel):
     include: list[str] = Field(default_factory=list)
     # Likewise a request for token logprobs, which this server does not produce.
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, value):
+        for key, item in value.items():
+            if len(key) > 64:
+                raise ValueError("Metadata keys must be at most 64 characters")
+            if len(item) > 512:
+                raise ValueError("Metadata values must be at most 512 characters")
+        return value
 
     @field_validator(
         "store", "background", "previous_response_id", "conversation", "prompt",

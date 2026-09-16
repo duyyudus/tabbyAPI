@@ -16,6 +16,7 @@ import time
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex", action="store_true")
+    parser.add_argument("--skip-js", action="store_true", help="Skip the JavaScript SDK smoke test")
     parser.add_argument(
         "--codex-web-search", action="store_true",
         help="Implies --codex; enables Codex's hosted web_search tool, as the desktop app sends it",
@@ -50,10 +51,11 @@ def main():
                         time.sleep(0.1)
                 else:
                     raise TimeoutError("Fixture server did not start")
-                subprocess.run(
-                    [shutil.which("npm") or "npm", "test", "--prefix", "tests/responses_clients"],
-                    cwd=root, env=env, check=True, timeout=30,
-                )
+                if not args.skip_js:
+                    subprocess.run(
+                        [shutil.which("npm") or "npm", "test", "--prefix", "tests/responses_clients"],
+                        cwd=root, env=env, check=True, timeout=30,
+                    )
                 if args.codex or args.codex_web_search:
                     (work / "fixture.txt").write_text("before\n")
                     command = [shutil.which("codex") or "codex", "exec", "--ignore-user-config",
@@ -64,7 +66,7 @@ def main():
                         'model_providers.tabby_fixture={name="Tabby fixture",base_url="' + base_url +
                         '",wire_api="responses",requires_openai_auth=false,supports_websockets=false,'
                         'request_max_retries=0,stream_max_retries=0}',
-                        'web_search="enabled"' if args.codex_web_search else 'web_search="disabled"',
+                        'web_search="live"' if args.codex_web_search else 'web_search="disabled"',
                         'model_reasoning_summary="none"',
                         'model_supports_reasoning_summaries=false', 'approval_policy="never"',
                         'features.multi_agent=true', 'features.apps=false',

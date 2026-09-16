@@ -175,11 +175,25 @@ class InputTests(unittest.TestCase):
         for option in ({"store": True}, {"previous_response_id": "r"}, {"background": True},
                        {"conversation": "c"}, {"unknown": True},
                        {"prompt": {"id": "p"}}, {"max_tool_calls": 3},
-                       {"context_management": {"type": "auto"}}, {"truncation": "auto"},
+                       {"context_management": [{"type": "compaction", "compact_threshold": 1000}]},
+                       {"truncation": "auto"},
                        {"reasoning": {"summary": "verbose"}},
                        {"tools": [{"type": "function"}]}):
             with self.assertRaises(ValidationError):
                 ResponsesRequest(input="x", **option)
+
+    def test_official_request_limits(self):
+        for option in (
+            {"max_output_tokens": 15},
+            {"metadata": {"k" * 65: "value"}},
+            {"metadata": {"key": "v" * 513}},
+            {"metadata": {str(index): "value" for index in range(17)}},
+        ):
+            with self.subTest(option=option), self.assertRaises(ValidationError):
+                ResponsesRequest(input="x", **option)
+        ResponsesRequest(
+            input="x", max_output_tokens=16, metadata={"k" * 64: "v" * 512}
+        )
 
     def test_unsupported_options_state_a_reason(self):
         """A rejection that cannot be acted on is a debugging session, not an error."""
@@ -188,6 +202,7 @@ class InputTests(unittest.TestCase):
             ({"previous_response_id": "r"}, "replay the earlier items"),
             ({"truncation": "auto"}, "truncated"),
             ({"prompt": {"id": "p"}}, "instructions instead"),
+            ({"context_management": [{"type": "compaction"}]}, "not implemented"),
             ({"moderation": {"model": "m"}}, "filtering that never happens"),
         ):
             with self.assertRaises(ValidationError) as caught:
@@ -311,6 +326,10 @@ class InputTests(unittest.TestCase):
         self.assertEqual(responses_input.loggable("evil\n12:00 ERROR:\x1b[31m x"),
                          "evil 12:00 ERROR: [31m x")
         self.assertEqual(len(responses_input.loggable("a" * 500)), 64)
+        with patch.object(responses_input, "_warned_tool_sets", set()), \
+                patch.object(responses_input, "xlogger") as log:
+            adapt_request(ResponsesRequest(input="x", tools=[{"type": "evil\n12:00 ERROR"}]))
+        self.assertNotIn("\n", log.warning.call_args.args[1]["types"])
 
     def test_images_rejected_on_text_model(self):
         data = ResponsesRequest(input=[{"role": "user", "content": [
@@ -435,6 +454,29 @@ class AccumulatorTests(unittest.TestCase):
         self.assertEqual(acc.response.usage.total_tokens, 15)
         self.assertIsNone(acc.response.usage.output_tokens_details.reasoning_tokens)
         self.assertEqual(acc.response.output[0].content[0].text, "hello")
+
+    def test_stream_item_lifecycle_and_ids(self):
+        acc = self.make(tools=[FUNCTION])
+        events = acc.start()
+        events += acc.consume(packet([(CONTENT, "before"), (TOOL, tool_text())]))
+        events += acc.finish(finish())
+        kinds = [event["type"] for event in events]
+        self.assertEqual(kinds[:2], ["response.created", "response.in_progress"])
+        self.assertEqual(kinds[-1], "response.completed")
+        self.assertEqual(
+            [event["item"]["type"] for event in events if event["type"] == "response.output_item.done"],
+            ["message", "function_call"],
+        )
+        for index, item in enumerate(events[-1]["response"]["output"]):
+            added = next(event for event in events if event["type"] == "response.output_item.added"
+                         and event["output_index"] == index)
+            done = next(event for event in events if event["type"] == "response.output_item.done"
+                        and event["output_index"] == index)
+            self.assertEqual(added["item"]["id"], item["id"])
+            self.assertEqual(done["item"], item)
+            self.assertEqual(added["item"]["status"], "in_progress")
+            self.assertEqual(item["status"], "completed")
+        self.assertEqual(events[-1]["response"]["status"], "completed")
 
     def test_mixed_order_custom_input(self):
         acc = self.make(tools=[FUNCTION, CUSTOM])
@@ -602,6 +644,8 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
              "tools[0].tools[0].name"),
             # A real field whose name collides with a union tag must survive.
             ({"input": "x", "text": {"format": {"type": "bogus"}}}, "text.format.type"),
+            ({"input": "x", "max_output_tokens": 15}, "max_output_tokens"),
+            ({"input": "x", "metadata": {"key": "v" * 513}}, "metadata"),
         ]
         for payload, param in cases:
             response = await self.client.post("/v1/responses", json=payload)

@@ -118,9 +118,13 @@ def describe_ignored_tool(definition):
 
 def warn_ignored_tools(definitions):
     counts = Counter(describe_ignored_tool(definition) for definition in definitions)
-    listed = ", ".join(name if count == 1 else f"{name}(x{count})" for name, count in counts.items())
+    listed = ", ".join(
+        name if count == 1 else f"{name}(x{count})" for name, count in counts.items()
+    )
     message = "Ignoring hosted or unknown tool types, which are not executed locally:"
-    types = ", ".join(sorted({str(definition.get("type", "unknown")) for definition in definitions}))
+    types = ", ".join(
+        sorted({loggable(definition.get("type", "unknown")) for definition in definitions})
+    )
     extra = {"types": types, "tools": listed}
     signature = frozenset(counts.items())
     if signature in _warned_tool_sets:
