@@ -140,3 +140,10 @@ This fork supports stateless `POST /v1/responses` with SSE streaming, function t
 custom text/Lark tools, and client-managed conversation replay. See the
 [Responses API guide](docs/11.-Responses-API.md) for supported parameters, examples,
 Codex configuration, and tested client versions.
+
+### Anthropic Messages API
+
+This fork also supports stateless `POST /v1/messages` and `/v1/messages/count_tokens`,
+so Claude Code and the Anthropic SDKs can use a local model. See the
+[Anthropic Messages API guide](docs/12.-Anthropic-Messages-API.md) for Claude Code setup
+and supported parameters.
