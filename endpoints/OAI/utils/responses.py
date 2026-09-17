@@ -14,14 +14,16 @@ from endpoints.OAI.types.responses import (
     FunctionCall,
     InputTokenDetails,
     OutputMessage,
+    OutputReasoning,
     OutputText,
+    ReasoningText,
     ResponseEvent,
     ResponseObject,
     ResponseUsage,
 )
 from endpoints.OAI.utils.chat_completion import iter_generation_events, _resolve_start_in_reasoning
 from endpoints.OAI.utils.responses_input import InvalidModelOutput, schema_validator
-from endpoints.OAI.utils.stream_parser import CONTENT, TOOL
+from endpoints.OAI.utils.stream_parser import CONTENT, REASONING, TOOL
 from endpoints.OAI.utils.tools import parse_toolcalls
 
 
@@ -50,6 +52,7 @@ class ResponsesAccumulator:
         self.tools = tools
         self.sequence = 0
         self.message = None
+        self.reasoning = None
         self.segments = []
         self.last_channel = None
         self.deferred = False
@@ -130,6 +133,42 @@ class ResponsesAccumulator:
             ),
         ]
 
+    def think(self, text):
+        events = []
+        if self.reasoning is None:
+            self.reasoning = OutputReasoning(content=[ReasoningText()])
+            self.response.output.append(self.reasoning)
+            events.append(self.event(
+                "response.output_item.added",
+                output_index=len(self.response.output) - 1,
+                item=self.reasoning.model_dump(),
+            ))
+        self.reasoning.content[0].text += text
+        events.append(self.event(
+            "response.reasoning_text.delta",
+            output_index=len(self.response.output) - 1,
+            item_id=self.reasoning.id,
+            content_index=0,
+            delta=text,
+        ))
+        return events
+
+    def close_reasoning(self, status="completed"):
+        if self.reasoning is None:
+            return []
+        item = self.reasoning
+        self.reasoning = None
+        item.status = status
+        index = len(self.response.output) - 1
+        return [
+            self.event(
+                "response.reasoning_text.done",
+                output_index=index, item_id=item.id,
+                content_index=0, text=item.content[0].text,
+            ),
+            self.event("response.output_item.done", output_index=index, item=item.model_dump()),
+        ]
+
     def consume(self, packet):
         self.tool_format = packet["tool_format"]
         events = []
@@ -138,6 +177,8 @@ class ResponsesAccumulator:
                 continue
             if channel != CONTENT and self.last_channel == CONTENT and not self.deferred:
                 events += self.close_text()
+            if channel != REASONING and self.last_channel == REASONING and not self.deferred:
+                events += self.close_reasoning()
             if channel == TOOL:
                 self.deferred = True
             if self.deferred:
@@ -147,6 +188,8 @@ class ResponsesAccumulator:
                     self.segments.append([channel, text])
             elif channel == CONTENT:
                 events += self.text(text)
+            elif channel == REASONING:
+                events += self.think(text)
             self.last_channel = channel
         return events
 
@@ -241,12 +284,18 @@ class ResponsesAccumulator:
             parsed_segments = [(c, t, None) for c, t in self.segments]
         for channel, text, calls in parsed_segments:
             if channel == CONTENT:
+                events += self.close_reasoning("incomplete" if limited else "completed")
                 events += self.text(text)
+            elif channel == REASONING:
+                events += self.close_text("incomplete" if limited else "completed")
+                events += self.think(text)
             else:
                 events += self.close_text("incomplete" if limited else "completed")
+                events += self.close_reasoning("incomplete" if limited else "completed")
                 for call in calls or []:
                     events += self.emit_call(call)
         events += self.close_text("incomplete" if limited else "completed")
+        events += self.close_reasoning("incomplete" if limited else "completed")
         self.response.status = "incomplete" if limited else "completed"
         if limited:
             self.response.incomplete_details = {"reason": "max_output_tokens"}
@@ -258,6 +307,7 @@ class ResponsesAccumulator:
 
     def fail(self, message, code="server_error"):
         events = self.close_text("incomplete")
+        events += self.close_reasoning("incomplete")
         self.response.status = "failed"
         self.response.error = {"code": code, "message": message}
         self.finished = True

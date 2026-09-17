@@ -27,6 +27,14 @@ FUNCTION = {"type": "function", "name": "read", "parameters": {
     "type": "object", "properties": {"path": {"type": "string"}},
     "required": ["path"], "additionalProperties": False,
 }, "strict": True}
+EDIT = {"type": "function", "name": "edit", "parameters": {
+    "type": "object", "properties": {
+        "path": {"type": "string"},
+        "edits": {"type": "array", "items": {"type": "object", "properties": {
+            "oldText": {"type": "string"}, "newText": {"type": "string"},
+        }, "required": ["oldText", "newText"], "additionalProperties": False}},
+    }, "required": ["path", "edits"], "additionalProperties": False,
+}, "strict": True}
 CUSTOM = {"type": "custom", "name": "patch", "format": {
     "type": "grammar", "syntax": "lark", "definition": 'start: "*** Begin Patch" "\\n" "*** End Patch" "\\n"',
 }}
@@ -278,18 +286,17 @@ class InputTests(unittest.TestCase):
             chat, _ = adapt_request(data)
             self.assertEqual(chat.reasoning_effort, "high")
 
-    def test_replayed_reasoning_items_are_ignored(self):
-        """Codex echoes reasoning items back; they must not break call/result pairing."""
+    def test_replayed_reasoning_reaches_assistant_tool_call(self):
         data = ResponsesRequest(input=[
             {"role": "user", "content": "hi"},
             {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque",
-             "summary": [{"type": "summary_text", "text": "ignored"}]},
+             "content": [{"type": "reasoning_text", "text": "I should read f."}]},
             {"type": "function_call", "call_id": "c1", "name": "read", "arguments": '{"path": "f"}'},
-            {"type": "reasoning", "id": "rs_2"},
             {"type": "function_call_output", "call_id": "c1", "output": "ok"},
         ], tools=[FUNCTION])
         chat, _ = adapt_request(data)
         self.assertEqual([m.role for m in chat.messages], ["user", "assistant", "tool"])
+        self.assertEqual(chat.messages[1].reasoning_content, "I should read f.")
         self.assertNotIn("opaque", json.dumps([m.model_dump() for m in chat.messages], default=str))
 
     def test_hosted_tools_accepted_but_ignored(self):
@@ -349,13 +356,29 @@ class InputTests(unittest.TestCase):
             with self.assertRaises(ResponseRequestError):
                 adapt_request(ResponsesRequest(input="x", tools=[tool]))
 
-    def test_normalized_strict_echo(self):
+    def test_omitted_strict_preserves_optional_properties(self):
+        data = ResponsesRequest(input="x", tools=[{"type": "function", "name": "read", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "offset": {"type": "number"},
+                           "limit": {"type": "number"}},
+            "required": ["path"],
+        }}])
+        _, tools = adapt_request(data)
+        self.assertFalse(data.tools[0].strict)
+        self.assertEqual(data.tools[0].parameters["required"], ["path"])
+        acc = ResponsesAccumulator(data, tools, "test-model")
+        acc.consume(packet([(TOOL, tool_text(arguments={"path": "x"}))]))
+        acc.finish(finish())
+        self.assertEqual(acc.response.output[0].name, "read")
+
+    def test_omitted_strict_normalizes_already_required_properties(self):
         data = ResponsesRequest(input="x", tools=[{"type": "function", "name": "f", "parameters": {
-            "type": "object", "properties": {"x": {"type": "string"}},
+            "type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"],
         }}])
         adapt_request(data)
         self.assertTrue(data.tools[0].strict)
         self.assertEqual(data.tools[0].parameters["required"], ["x"])
+        self.assertFalse(data.tools[0].parameters["additionalProperties"])
 
     def test_namespace_tools_are_qualified_and_preserved(self):
         data = ResponsesRequest(input="x", tools=[NAMESPACE])
@@ -486,9 +509,74 @@ class AccumulatorTests(unittest.TestCase):
                             (CONTENT, "after")]))
         acc.finish(finish())
         self.assertEqual([i.type for i in acc.response.output],
-                         ["message", "function_call", "message", "custom_tool_call", "message"])
-        self.assertEqual(acc.response.output[3].input, value)
-        self.assertNotIn("hidden", acc.response.model_dump_json())
+                         ["message", "function_call", "reasoning", "message", "custom_tool_call", "message"])
+        self.assertEqual(acc.response.output[4].input, value)
+        self.assertEqual(acc.response.output[2].content[0].text, "hidden")
+
+    def test_reasoning_stream_round_trip(self):
+        acc = self.make(tools=[FUNCTION])
+        events = acc.start()
+        events += acc.consume(packet([(REASONING, "I should ")]))
+        events += acc.consume(packet([(REASONING, "read f."), (TOOL, tool_text())]))
+        events += acc.finish(finish())
+        self.assertEqual(
+            [item["type"] for item in events[-1]["response"]["output"]],
+            ["reasoning", "function_call"],
+        )
+        self.assertEqual(
+            "".join(event["delta"] for event in events
+                    if event["type"] == "response.reasoning_text.delta"),
+            "I should read f.",
+        )
+        self.assertIn("response.reasoning_text.done", [e["type"] for e in events])
+        replay = ResponsesRequest(input=[
+            {"role": "user", "content": "hi"},
+            *events[-1]["response"]["output"],
+            {"type": "function_call_output", "call_id": acc.response.output[1].call_id,
+             "output": "file contents"},
+        ], tools=[FUNCTION])
+        chat, _ = adapt_request(replay)
+        self.assertEqual(chat.messages[1].reasoning_content, "I should read f.")
+        self.assertEqual(chat.messages[2].content, "file contents")
+
+    def test_glm_json_quoted_array_argument_is_decoded_before_validation(self):
+        acc = self.make(tools=[EDIT])
+        edits = [{"oldText": "before\n", "newText": "after\n"}]
+        raw = (
+            "<tool_call>edit"
+            "<arg_key>path</arg_key><arg_value>file.py</arg_value>"
+            "<arg_key>edits</arg_key><arg_value>"
+            + json.dumps(json.dumps(edits))
+            + "</arg_value></tool_call>"
+        )
+        acc.consume({"events": [(TOOL, raw)], "generation": {}, "tool_format": "glm4_5"})
+        acc.finish(finish())
+        self.assertEqual(json.loads(acc.response.output[0].arguments)["edits"], edits)
+
+    def test_bad_edit_argument_reports_field_without_dumping_value(self):
+        acc = self.make(tools=[EDIT])
+        raw = (
+            "<tool_call>edit"
+            "<arg_key>path</arg_key><arg_value>file.py</arg_value>"
+            "<arg_key>edits</arg_key><arg_value>not a JSON array</arg_value>"
+            "</tool_call>"
+        )
+        acc.consume({"events": [(TOOL, raw)], "generation": {}, "tool_format": "glm4_5"})
+        with self.assertRaisesRegex(InvalidModelOutput, "edit at edits: expected array"):
+            acc.finish(finish())
+
+    def test_missing_edit_path_reports_available_keys(self):
+        acc = self.make(tools=[EDIT])
+        raw = (
+            "<tool_call>edit"
+            "<arg_key>edits</arg_key><arg_value>[]</arg_value>"
+            "</tool_call>"
+        )
+        acc.consume({"events": [(TOOL, raw)], "generation": {}, "tool_format": "glm4_5"})
+        with self.assertRaisesRegex(
+            InvalidModelOutput, "'path' is a required property.*provided keys: edits"
+        ):
+            acc.finish(finish())
 
     def test_namespaced_function_and_custom_calls(self):
         acc = self.make(tools=[NAMESPACE])

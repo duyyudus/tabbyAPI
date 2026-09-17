@@ -90,11 +90,7 @@ class ToolResult(WireModel):
 
 
 class ReasoningItem(WireModel):
-    """A reasoning item replayed by a client: accepted for wire compatibility, never used.
-
-    No reasoning items are produced, so nothing here can round-trip meaningfully. Field
-    drift in the upstream item is tolerated because the whole item is dropped on input.
-    """
+    """A reasoning item replayed by a client."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -104,6 +100,19 @@ class ReasoningItem(WireModel):
     content: list = Field(default_factory=list)
     encrypted_content: str | None = None
     status: Literal["in_progress", "completed", "incomplete"] | None = None
+
+
+class ReasoningText(WireModel):
+    type: Literal["reasoning_text"] = "reasoning_text"
+    text: str = ""
+
+
+class OutputReasoning(WireModel):
+    type: Literal["reasoning"] = "reasoning"
+    id: str = Field(default_factory=lambda: "rs_" + uuid4().hex)
+    status: Literal["in_progress", "completed", "incomplete"] = "in_progress"
+    summary: list = Field(default_factory=list)
+    content: list[ReasoningText] = Field(default_factory=list)
 
 
 InputItem = Annotated[
@@ -205,8 +214,7 @@ class TextOptions(WireModel):
 
 class ReasoningOptions(WireModel):
     effort: str | None = None
-    # A summary request is a request for available data, not a demand to invent one:
-    # every mode is accepted and none is honored, because reasoning stays internal.
+    # Summaries are not generated; raw model reasoning is returned in content.
     summary: Literal["auto", "concise", "detailed", "none"] | None = None
 
 
@@ -262,7 +270,7 @@ class ResponsesRequest(WireModel):
     truncation: str = "disabled"
     # An include is a request for available data, not a demand to invent it: any
     # include is accepted, and one whose data this server never produces yields
-    # nothing. No reasoning items are returned, so no encrypted content exists.
+    # nothing. Raw local reasoning has no encrypted representation.
     include: list[str] = Field(default_factory=list)
     # Likewise a request for token logprobs, which this server does not produce.
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
@@ -345,7 +353,7 @@ class ResponseObject(WireModel):
     status: Literal["in_progress", "completed", "incomplete", "failed"] = "in_progress"
     error: dict | None = None
     incomplete_details: dict | None = None
-    output: list[OutputMessage | FunctionCall | CustomCall] = Field(default_factory=list)
+    output: list[OutputMessage | OutputReasoning | FunctionCall | CustomCall] = Field(default_factory=list)
     model: str
     usage: ResponseUsage | None = None
     store: bool = False

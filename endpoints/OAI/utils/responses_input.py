@@ -6,6 +6,7 @@ from collections import Counter
 from copy import deepcopy
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from referencing import Registry
 from lark import Lark
 
@@ -57,7 +58,27 @@ def schema_validator(schema):
         raise ResponseRequestError(f"Invalid JSON schema: {exc}") from exc
 
 
-def normalize_strict(schema, explicit=False):
+def decode_structured_arguments(args, schema):
+    """Recover JSON containers quoted by a model inside a tool argument value."""
+    properties = schema.get("properties", {})
+    result = args.copy()
+    for key, value in args.items():
+        if not isinstance(value, str):
+            continue
+        property_schema = properties.get(key)
+        expected = property_schema.get("type") if isinstance(property_schema, dict) else None
+        if expected not in ("array", "object"):
+            continue
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(decoded, list if expected == "array" else dict):
+            result[key] = decoded
+    return result
+
+
+def normalize_strict(schema, explicit=False, preserve_optional=False):
     """Normalize supported object schemas, without changing property value types."""
     result = deepcopy(schema)
 
@@ -72,6 +93,8 @@ def normalize_strict(schema, explicit=False):
             )
         if node.get("type") == "object" or "properties" in node:
             properties = node.get("properties", {})
+            if preserve_optional and set(node.get("required", [])) != set(properties):
+                raise ResponseRequestError("Optional properties require non-strict tool validation")
             if node.get("additionalProperties") not in (None, False):
                 raise ResponseRequestError("Strict schemas require additionalProperties:false")
             if explicit and (
@@ -182,7 +205,11 @@ class ToolAdapter:
                 raise ResponseRequestError("Function parameters must be an object schema", "tools")
             if tool.strict is not False:
                 try:
-                    tool.parameters = normalize_strict(tool.parameters, tool.strict is True)
+                    tool.parameters = normalize_strict(
+                        tool.parameters,
+                        explicit=tool.strict is True,
+                        preserve_optional=tool.strict is None,
+                    )
                     tool.strict = True
                 except ResponseRequestError:
                     if tool.strict is True:
@@ -255,10 +282,29 @@ class ToolAdapter:
                 args = json.loads(call.function.arguments)
                 if not isinstance(args, dict):
                     raise ValueError("Function arguments must be a JSON object")
+                tool = self.tools[name]
+                if isinstance(tool, FunctionTool):
+                    decoded = decode_structured_arguments(args, tool.parameters)
+                    if decoded != args:
+                        args = decoded
+                        call.function.arguments = json.dumps(args, ensure_ascii=False)
                 if name in self.validators:
                     self.validators[name].validate(args)
                 if name in self.grammars:
                     self.grammars[name].parse(args["input"])
+            except JSONSchemaValidationError as exc:
+                location = ".".join(map(str, exc.path)) or "arguments"
+                detail = (
+                    f"expected {exc.validator_value}"
+                    if exc.validator == "type"
+                    else exc.message[:200]
+                )
+                if exc.validator == "required" and isinstance(args, dict):
+                    names = ", ".join(sorted(args)[:10]) or "none"
+                    detail += f" (provided keys: {names})"
+                raise InvalidModelOutput(
+                    f"Invalid arguments for tool {name} at {location}: {detail}"
+                ) from exc
             except Exception as exc:
                 raise InvalidModelOutput(f"Invalid arguments for tool {name}: {exc}") from exc
         return calls
@@ -292,14 +338,43 @@ def adapt_request(data, vision=False):
     )
     calls = {}
     answered = set()
+    pending_reasoning = []
+
+    def attach_reasoning(message):
+        if pending_reasoning:
+            prior = message.get("reasoning_content")
+            message["reasoning_content"] = (prior + "\n\n" if prior else "") + "\n\n".join(
+                pending_reasoning
+            )
+            pending_reasoning.clear()
+
     for item in items:
         if isinstance(item, ReasoningItem):
-            # Replayed reasoning has no representation in the chat context; drop it
-            # without disturbing call/result pairing around it.
+            # Local output puts the full trace in content. External items may only
+            # carry a summary; opaque encrypted content cannot be reconstructed.
+            parts = item.content or item.summary
+            pending_reasoning.extend(
+                part["text"] for part in parts
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
             continue
         elif isinstance(item, InputMessage):
-            messages.append({"role": item.role, "content": convert_content(item.content, vision)})
+            if pending_reasoning and item.role != "assistant":
+                message = {"role": "assistant"}
+                attach_reasoning(message)
+                messages.append(message)
+            message = {"role": item.role, "content": convert_content(item.content, vision)}
+            if item.role == "assistant":
+                attach_reasoning(message)
+            messages.append(message)
         elif isinstance(item, ToolResult):
+            if pending_reasoning:
+                if messages and messages[-1]["role"] == "assistant":
+                    attach_reasoning(messages[-1])
+                else:
+                    message = {"role": "assistant"}
+                    attach_reasoning(message)
+                    messages.append(message)
             if item.call_id not in calls or item.call_id in answered:
                 raise ResponseRequestError("Tool output requires a unique preceding call", "input")
             expected = calls[item.call_id] + "_output"
@@ -335,9 +410,16 @@ def adapt_request(data, vision=False):
                 "function": {"name": item.name, "arguments": arguments},
             }
             if messages and messages[-1]["role"] == "assistant":
+                attach_reasoning(messages[-1])
                 messages[-1].setdefault("tool_calls", []).append(call)
             else:
-                messages.append({"role": "assistant", "tool_calls": [call]})
+                message = {"role": "assistant", "tool_calls": [call]}
+                attach_reasoning(message)
+                messages.append(message)
+    if pending_reasoning:
+        message = {"role": "assistant"}
+        attach_reasoning(message)
+        messages.append(message)
     if set(calls) != answered:
         raise ResponseRequestError(
             "Every replayed call needs a tool result before generation", "input"
