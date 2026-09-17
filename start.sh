@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# Allow a config file as the first argument, alongside the existing --config option.
+if [ "$#" -gt 0 ]; then
+    case "$1" in
+        *.yml|*.yaml) set -- --config "$@" ;;
+    esac
+fi
+
 cd "$(dirname "$0")" || exit
 
 if command -v uv >/dev/null 2>&1; then
