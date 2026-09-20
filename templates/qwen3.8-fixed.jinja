@@ -1,0 +1,283 @@
+{#- Qwen3.8 chat template, correctness-fixed.
+
+    Base: Qwen/Qwen3.8-Flash-Next chat_template.jinja (unmodified wording throughout).
+
+    Contract: this renders byte-identical output to the official template for every
+    input the official template handles correctly. It deviates ONLY where the official
+    template raises on valid input or emits malformed bytes. Each deviation is marked
+    FIX-n below.
+
+    Explicitly NOT included: injected style/persona instructions, rewritten tool-call
+    instructions, synthetic tool-error warnings, inline magic tags, or any other change
+    to what the model is told to do. The tool block and reasoning strings are verbatim
+    upstream.
+
+    Optional kwarg: default_reasoning_effort (default 'xhigh', matching upstream).
+#}
+{%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- macro render_content(content, do_vision_count, is_system_content=false) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping %}
+        {%- for item in content %}
+            {#- FIX-1: upstream tests `'image' in item` before checking that item is a
+                mapping, so a plain string list item containing the substring "image"
+                is replaced by a vision placeholder and its text is lost. Gate on
+                mapping first; render non-mapping items as text. #}
+            {%- if item is not mapping %}
+                {{- item | string }}
+            {%- elif 'image' in item or 'image_url' in item or item.type == 'image' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain images.') }}
+                {%- endif %}
+                {%- if do_vision_count %}
+                    {%- set image_count.value = image_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}
+                    {{- 'Picture ' ~ image_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+            {#- FIX-2: upstream accepts 'image_url' but not 'video_url', so an
+                OpenAI-shaped video part hits 'Unexpected item type in content.' #}
+            {%- elif 'video' in item or 'video_url' in item or item.type == 'video' %}
+                {%- if is_system_content %}
+                    {{- raise_exception('System message cannot contain videos.') }}
+                {%- endif %}
+                {%- if do_vision_count %}
+                    {%- set video_count.value = video_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}
+                    {{- 'Video ' ~ video_count.value ~ ': ' }}
+                {%- endif %}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+            {%- elif 'text' in item %}
+                {{- item.text }}
+            {%- else %}
+                {{- raise_exception('Unexpected item type in content.') }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif content is none or content is undefined %}
+        {{- '' }}
+    {%- else %}
+        {{- raise_exception('Unexpected content type.') }}
+    {%- endif %}
+{%- endmacro %}
+{%- if not messages %}
+    {{- raise_exception('No messages provided.') }}
+{%- endif %}
+{#- FIX-3: upstream reads `enable_thinking is true` here but `enable_thinking is false`
+    at the generation prompt. Those are strict identity tests, so a non-bool truthy
+    value (1, "yes") suppresses the reasoning instructions while still emitting an open
+    <think>, leaving the two sites inconsistent. Resolve once, up front. Identical
+    output for True / False / undefined. #}
+{%- set state = namespace(thinking=true, effort='') %}
+{%- if enable_thinking is defined and not enable_thinking %}
+    {%- set state.thinking = false %}
+{%- endif %}
+{%- if state.thinking %}
+    {%- set _effort_raw = reasoning_effort if (reasoning_effort is defined and reasoning_effort is not none) else (default_reasoning_effort if default_reasoning_effort is defined else 'xhigh') %}
+    {%- set _effort = _effort_raw | string | lower %}
+    {#- FIX-4: upstream raises on any value outside xhigh/medium/low, so the standard
+        OpenAI effort names clients actually send ("high", "minimal", "none") fail the
+        whole request. Map the unambiguous synonyms; anything else still raises, so
+        typos remain loud. This normalizes input only -- it does not change what any
+        accepted value means. #}
+    {%- if _effort in ('xhigh', 'medium', 'low') %}
+        {%- set state.effort = _effort %}
+    {%- elif _effort in ('high', 'max') %}
+        {%- set state.effort = 'xhigh' %}
+    {%- elif _effort == 'minimal' %}
+        {%- set state.effort = 'low' %}
+    {%- elif _effort in ('none', 'off') %}
+        {%- set state.thinking = false %}
+    {%- else %}
+        {{- raise_exception('Unexpected reasoning effort ' ~ _effort_raw ~ '. Supported types are xhigh (default), medium, and low.') }}
+    {%- endif %}
+{%- endif %}
+{%- set reasoning_instructions = '' %}
+{%- if state.thinking %}
+    {%- if state.effort == 'xhigh' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+    {%- elif state.effort == 'low' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
+    {%- endif %}
+{%- endif %}
+{#- FIX-5: upstream only recognises a system message at index 0 and raises
+    'System message must be at the beginning.' for any other one -- so two leading
+    system messages, which OpenAI clients routinely send, kill the request. Merge
+    consecutive leading system/developer messages into one turn joined by a blank
+    line (identical bytes when there is exactly one). 'developer' is treated as
+    'system' per the OpenAI role equivalence; upstream raises on it. #}
+{%- set head = namespace(count=0, done=false) %}
+{%- for message in messages %}
+    {%- if not head.done and (message.role == 'system' or message.role == 'developer') %}
+        {%- set head.count = head.count + 1 %}
+    {%- else %}
+        {%- set head.done = true %}
+    {%- endif %}
+{%- endfor %}
+{%- set sys = namespace(content='') %}
+{%- for message in messages[:head.count] %}
+    {%- set part = render_content(message.content, false, true)|trim %}
+    {%- if part %}
+        {%- if sys.content %}
+            {%- set sys.content = sys.content ~ '\n\n' ~ part %}
+        {%- else %}
+            {%- set sys.content = part %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- set system_content = sys.content %}
+{%- set body = messages[head.count:] %}
+{%- if tools and tools is iterable and tools is not mapping %}
+    {{- '<|im_start|>system\n' }}
+    {%- if reasoning_instructions %}
+        {{- reasoning_instructions + '\n\n' }}
+    {%- endif %}
+    {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>" }}
+    {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+    {%- if system_content %}
+        {{- '\n\n' + system_content }}
+    {%- endif %}
+    {{- '<|im_end|>\n' }}
+{%- else %}
+    {%- if system_content %}
+        {{- '<|im_start|>system\n' + (reasoning_instructions + '\n\n' if reasoning_instructions else '') + system_content + '<|im_end|>\n' }}
+    {%- elif reasoning_instructions %}
+        {{- '<|im_start|>system\n' + reasoning_instructions + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- set ns = namespace(multi_step_tool=true, last_query_index=body|length - 1) %}
+{%- for message in body[::-1] %}
+    {%- set index = (body|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = render_content(message.content, false)|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if ns.multi_step_tool %}
+    {#- FIX-6: upstream raises 'No user query found in messages.' here, which kills any
+        agent loop resuming from tool output. The guard is also gratuitous: this index
+        is only read when preserve_thinking is explicitly false, so with the default the
+        request is rejected over a value the template never uses. Fall back to 0, which
+        preserves every historical think block -- the same result the default produces. #}
+    {%- set ns.last_query_index = 0 %}
+{%- endif %}
+{%- set walk = namespace(prev_role='') %}
+{%- for message in body %}
+    {%- set is_system = (message.role == "system" or message.role == "developer") %}
+    {%- set content = render_content(message.content, true, is_system)|trim %}
+    {%- if is_system %}
+        {#- FIX-5 (cont.): a system message after the first turn renders as its own
+            turn instead of raising. #}
+        {{- '<|im_start|>system\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {%- set think = namespace(reasoning='', content=content) %}
+        {%- if message.reasoning_content is string %}
+            {%- set think.reasoning = message.reasoning_content %}
+        {%- endif %}
+        {#- FIX-7: upstream reads only message.reasoning_content, so history whose
+            thinking is inline in content gets a blank <think></think> prepended in
+            front of the real one -- two consecutive think blocks, a shape the model
+            was never trained on. Extract the inline block instead. Anchored at the
+            start of the content (or at a line-initial closing tag, which is what a
+            client echoes back when the opening <think> came from the prompt prefix)
+            so prose that merely mentions the tags is left alone. #}
+        {%- set close = '' %}
+        {%- if think.content.startswith('<think>') and '</think>' in think.content %}
+            {%- set close = '</think>' %}
+        {%- elif think.content.startswith('</think>') or '\n</think>' in think.content %}
+            {%- set close = '</think>' %}
+        {%- endif %}
+        {%- if close %}
+            {%- set inline = think.content.split(close)[0] %}
+            {%- if inline.startswith('<think>') %}
+                {%- set inline = inline[7:] %}
+            {%- endif %}
+            {%- if not think.reasoning %}
+                {%- set think.reasoning = inline %}
+            {%- endif %}
+            {%- set think.content = think.content.split(close)[1:] | join(close) | trim %}
+        {%- endif %}
+        {%- set reasoning_content = think.reasoning | trim %}
+        {%- set content = think.content %}
+        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
+        {%- endif %}
+        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
+            {%- for tool_call in message.tool_calls %}
+                {%- if tool_call.function is defined %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {%- if loop.first %}
+                    {%- if content|trim %}
+                        {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {%- else %}
+                        {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                    {%- endif %}
+                {%- else %}
+                    {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                {%- endif %}
+                {%- if tool_call.arguments is defined and tool_call.arguments != '' %}
+                    {#- FIX-8: upstream calls |items on arguments unconditionally, so the
+                        OpenAI wire format (arguments as a JSON *string*) dies with an
+                        opaque 'Can only get item pairs from a mapping'. Jinja cannot
+                        parse JSON, so there is no way to emit correct <parameter> blocks
+                        from a string -- raise something actionable instead. Dumping the
+                        raw string into the <function> block, as some forks do, produces a
+                        call shape the model never saw in training. #}
+                    {%- if tool_call.arguments is not mapping %}
+                        {{- raise_exception('tool_call arguments must be an object, got ' ~ (tool_call.arguments | string)[:64] ~ '. Deserialize JSON-string arguments before rendering.') }}
+                    {%- endif %}
+                    {%- for args_name, args_value in tool_call.arguments.items() %}
+                        {{- '<parameter=' + args_name + '>\n' }}
+                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}
+                        {{- args_value }}
+                        {{- '\n</parameter>\n' }}
+                    {%- endfor %}
+                {%- endif %}
+                {{- '</function>\n</tool_call>' }}
+            {%- endfor %}
+        {%- endif %}
+        {{- '<|im_end|>\n' }}
+    {%- elif message.role == "tool" %}
+        {#- FIX-9: upstream guards this with `loop.previtem`, which is undefined on the
+            first iteration, so a conversation opening with a tool message emits the
+            <tool_response> with no <|im_start|>user header at all. Track the previous
+            role explicitly. (This also drops the loop.previtem/nextitem dependency,
+            which not every engine's Jinja implementation provides.) #}
+        {%- if walk.prev_role != "tool" %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or body[loop.index0 + 1].role != "tool" %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- else %}
+        {{- raise_exception('Unexpected message role.') }}
+    {%- endif %}
+    {%- set walk.prev_role = message.role %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if not state.thinking %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- else %}
+        {{- '<think>\n' }}
+    {%- endif %}
+{%- endif %}

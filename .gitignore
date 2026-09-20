@@ -196,6 +196,7 @@ templates/*
 !templates/alpaca.jinja
 !templates/chatml.jinja
 !templates/lfm2.jinja
+!templates/qwen3.8-fixed.jinja
 
 # Sampler overrides folder
 sampler_overrides/*
