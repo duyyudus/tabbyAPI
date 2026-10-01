@@ -1,9 +1,9 @@
-from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from time import time
 from typing import Literal, Union, List, Optional, Dict
 from uuid import uuid4
 
-from endpoints.OAI.types.common import UsageStats, CommonCompletionRequest
+from endpoints.OAI.types.common import UsageStats, CommonCompletionRequest, Timings
 from endpoints.OAI.types.tools import NamedToolChoice, ToolSpec, ToolCall
 
 
@@ -77,8 +77,6 @@ class ReasoningOptions(BaseModel):
 
 # Inherited from common request
 class ChatCompletionRequest(CommonCompletionRequest):
-    # Internal policy used by Responses; not a Chat Completions request option.
-    _fail_on_grammar_error: bool = PrivateAttr(default=False)
     messages: List[ChatCompletionMessage]
     prompt_template: Optional[str] = None
     add_generation_prompt: Optional[bool] = True
@@ -179,6 +177,7 @@ class ChatCompletionResponse(BaseModel):
     model: str
     object: str = "chat.completion"
     usage: Optional[UsageStats] = None
+    timings: Optional[Timings] = None
 
 
 class ChatCompletionStreamChunk(BaseModel):

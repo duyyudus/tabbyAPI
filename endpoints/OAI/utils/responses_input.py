@@ -465,7 +465,6 @@ def adapt_request(data, vision=False):
         verbosity=data.text.verbosity,
         **params,
     )
-    chat._fail_on_grammar_error = True
     if tools.required:
         names = ", ".join(sorted(tools.allowed))
         chat.messages.insert(

@@ -155,7 +155,6 @@ class InputTests(unittest.TestCase):
         chat, _ = adapt_request(data)
         self.assertEqual([m.content for m in chat.messages], ["help", "hello"])
         self.assertEqual(chat.max_tokens, 42)
-        self.assertTrue(chat._fail_on_grammar_error)
 
     def test_function_custom_replay_and_parallel_results(self):
         raw = "  *** Begin Patch\n*** End Patch\n"
@@ -972,7 +971,7 @@ class AdditionalContractTests(unittest.IsolatedAsyncioTestCase):
             raise ValueError("bad grammar")
         grammar.LLGuidanceFilter = fail
         with self.assertRaises(ValueError):
-            grammar.ExLlamaV3Grammar().add_json_schema_filter({}, None, fail_on_error=True)
+            grammar.ExLlamaV3Grammar().add_json_schema_filter({}, None)
 
 
 class CancellationScopeTests(unittest.IsolatedAsyncioTestCase):

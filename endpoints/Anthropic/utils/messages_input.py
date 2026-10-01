@@ -400,5 +400,4 @@ def adapt_request(data, vision=False):
         continue_final_message=prefill,
         **params,
     )
-    chat._fail_on_grammar_error = schema is not None
     return chat, tools
