@@ -1,5 +1,6 @@
 """Tool call processing utilities for OAI server."""
 
+import ast
 import json
 import re
 from dataclasses import dataclass, field
@@ -285,6 +286,8 @@ def _validate_complete_calls(text, parser, calls):
         glm4_5: ("<tool_call>", "</tool_call>"),
         gemma4: ("<|tool_call>", "<tool_call|>"),
         harmony: ("<|message|>", "<|call|>"),
+        hermes: ("<tool_call>", "</tool_call>"),
+        kimi: ("<|tool_call_begin|>", "<|tool_call_end|>"),
     }
     if parser in markers:
         opening, closing = markers[parser]
@@ -298,6 +301,18 @@ def _validate_complete_calls(text, parser, calls):
         expected = json.loads(text.removeprefix(start).strip())
         if not isinstance(expected, list) or len(expected) != len(calls):
             raise ValueError("Tool parser could not consume every Mistral call")
+    # JSON argument parsers wrap undecodable arguments as {"input": raw}; reject those.
+    if parser is hermes:
+        for block in hermes._OUTER.findall(text):
+            call = hermes._parse_block(block)
+            _require_json_object(call.get("arguments", call.get("parameters", {})), allow_null=True)
+    if parser is kimi:
+        for match in kimi._CALL.finditer(text):
+            _require_json_object(match.group("args") or "{}")
+    if parser is olmo3:
+        _validate_olmo3_calls(text, calls)
+    if parser is lfm2:
+        _validate_lfm2_calls(text, calls)
     # Missing/duplicate parameter tags must not silently turn into fewer arguments.
     parameter_tags = {
         qwen3_coder: (r"<parameter=[^>]+>", "</parameter>"),
@@ -320,3 +335,72 @@ def _validate_complete_calls(text, parser, calls):
                 f"</arg_value{suffix}>"
             ):
                 raise ValueError("Unmatched tool argument values")
+
+
+def _require_json_object(args, allow_null=False):
+    """Reject tool arguments that are not a JSON object (or JSON text of one)."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            raise ValueError("Tool call arguments are not valid JSON") from None
+    if args is None and allow_null:
+        return
+    if not isinstance(args, dict):
+        raise ValueError("Tool call arguments are not a JSON object")
+
+
+def _olmo3_call_lines(text):
+    """Split each <function_calls> block into calls, joining lines as the olmo3 parser does."""
+    for block in olmo3._OUTER.findall(text):
+        pending = ""
+        for line in block.splitlines():
+            pending = f"{pending}\n{line}" if pending else line
+            if pending.count("(") <= pending.count(")"):
+                if pending.strip():
+                    yield pending
+                pending = ""
+        if pending.strip():
+            yield pending
+
+
+def _validate_olmo3_calls(text, calls):
+    """The olmo3 parser drops unparseable lines and arguments without a key."""
+    lines = list(_olmo3_call_lines(text))
+    if len(lines) != len(calls):
+        raise ValueError("Tool parser could not consume every call")
+    for line in lines:
+        match = olmo3._CALL.match(line.strip())
+        keys = []
+        for part in olmo3._split_args(match.group(2)):
+            key = olmo3._KEY.match(part)
+            if not key:
+                raise ValueError("Malformed tool parameters")
+            keys.append(key.group(1))
+        if len(keys) != len(set(keys)):
+            raise ValueError("Malformed or duplicate tool parameters")
+
+
+def _validate_lfm2_calls(text, calls):
+    """The lfm2 parser skips unparseable lists and ignores positional or non-literal values."""
+    total = 0
+    for block in lfm2._extract_tool_texts(text):
+        module, _ = lfm2._safe_parse_list(block)
+        body = module.body if module else []
+        node = getattr(body[0], "value", None) if len(body) == 1 else None
+        if not (isinstance(node, ast.List) and all(isinstance(e, ast.Call) for e in node.elts)):
+            raise ValueError("Malformed tool call list")
+        for call in node.elts:
+            keys = [kw.arg for kw in call.keywords]
+            if call.args or None in keys:
+                raise ValueError("Tool call arguments must be keyword arguments")
+            if len(keys) != len(set(keys)):
+                raise ValueError("Malformed or duplicate tool parameters")
+            for kw in call.keywords:
+                try:
+                    ast.literal_eval(kw.value)
+                except (ValueError, SyntaxError):
+                    raise ValueError("Tool call argument is not a literal value") from None
+        total += len(node.elts)
+    if total != len(calls):
+        raise ValueError("Tool parser could not consume every call")
