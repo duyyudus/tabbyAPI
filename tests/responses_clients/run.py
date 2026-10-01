@@ -2,6 +2,7 @@
 
 The backend is deterministic. Passing these tests does not qualify model quality.
 """
+
 import argparse
 import os
 from pathlib import Path
@@ -18,7 +19,8 @@ def main():
     parser.add_argument("--codex", action="store_true")
     parser.add_argument("--skip-js", action="store_true", help="Skip the JavaScript SDK smoke test")
     parser.add_argument(
-        "--codex-web-search", action="store_true",
+        "--codex-web-search",
+        action="store_true",
         help="Implies --codex; enables Codex's hosted web_search tool, as the desktop app sends it",
     )
     args = parser.parse_args()
@@ -37,8 +39,11 @@ def main():
         work = Path(directory)
         with (work / "server.log").open("w+") as log:
             server = subprocess.Popen(
-                [sys.executable, "tests/responses_mock_server.py"], cwd=root,
-                env=env, stdout=log, stderr=log,
+                [sys.executable, "tests/responses_mock_server.py"],
+                cwd=root,
+                env=env,
+                stdout=log,
+                stderr=log,
             )
             try:
                 for _ in range(100):
@@ -53,31 +58,60 @@ def main():
                     raise TimeoutError("Fixture server did not start")
                 if not args.skip_js:
                     subprocess.run(
-                        [shutil.which("npm") or "npm", "test", "--prefix", "tests/responses_clients"],
-                        cwd=root, env=env, check=True, timeout=30,
+                        [
+                            shutil.which("npm") or "npm",
+                            "test",
+                            "--prefix",
+                            "tests/responses_clients",
+                        ],
+                        cwd=root,
+                        env=env,
+                        check=True,
+                        timeout=30,
                     )
                 if args.codex or args.codex_web_search:
                     (work / "fixture.txt").write_text("before\n")
-                    command = [shutil.which("codex") or "codex", "exec", "--ignore-user-config",
-                               "--ephemeral", "--skip-git-repo-check", "-C", str(work),
-                               "-s", "workspace-write"]
+                    command = [
+                        shutil.which("codex") or "codex",
+                        "exec",
+                        "--ignore-user-config",
+                        "--ephemeral",
+                        "--skip-git-repo-check",
+                        "-C",
+                        str(work),
+                        "-s",
+                        "workspace-write",
+                    ]
                     options = [
-                        'model_provider="tabby_fixture"', 'model="test-model"',
-                        'model_providers.tabby_fixture={name="Tabby fixture",base_url="' + base_url +
-                        '",wire_api="responses",requires_openai_auth=false,supports_websockets=false,'
-                        'request_max_retries=0,stream_max_retries=0}',
+                        'model_provider="tabby_fixture"',
+                        'model="test-model"',
+                        'model_providers.tabby_fixture={name="Tabby fixture",base_url="'
+                        + base_url
+                        + '",wire_api="responses",requires_openai_auth=false,supports_websockets=false,'
+                        "request_max_retries=0,stream_max_retries=0}",
                         'web_search="live"' if args.codex_web_search else 'web_search="disabled"',
                         'model_reasoning_summary="none"',
-                        'model_supports_reasoning_summaries=false', 'approval_policy="never"',
-                        'features.multi_agent=true', 'features.apps=false',
-                        'features.skill_search=false', 'features.tool_suggest=false',
+                        "model_supports_reasoning_summaries=false",
+                        'approval_policy="never"',
+                        "features.multi_agent=true",
+                        "features.apps=false",
+                        "features.skill_search=false",
+                        "features.tool_suggest=false",
                     ]
                     for option in options:
                         command.extend(("-c", option))
-                    command.append("CODEX_PROTOCOL_SMOKE: Read fixture.txt, change before to after, "
-                                   "then report completion.")
-                    result = subprocess.run(command, stdin=subprocess.DEVNULL, cwd=work,
-                                            capture_output=True, text=True, timeout=60)
+                    command.append(
+                        "CODEX_PROTOCOL_SMOKE: Read fixture.txt, change before to after, "
+                        "then report completion."
+                    )
+                    result = subprocess.run(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        cwd=work,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
                     if result.returncode or "CODEX_PROTOCOL_SMOKE_OK" not in result.stdout:
                         raise RuntimeError(result.stdout + result.stderr)
                     if (work / "fixture.txt").read_text() != "after\n":

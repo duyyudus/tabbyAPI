@@ -23,9 +23,7 @@ class WireModel(BaseModel):
 Description = Annotated[str, BeforeValidator(lambda value: "" if value is None else value)]
 Parameters = Annotated[
     dict,
-    BeforeValidator(
-        lambda value: {"type": "object", "properties": {}} if value is None else value
-    ),
+    BeforeValidator(lambda value: {"type": "object", "properties": {}} if value is None else value),
 ]
 # Replayed assistant turns can carry annotations and logprobs produced elsewhere.
 # They are accepted and dropped: none are generated here, so none are echoed back.
@@ -227,9 +225,9 @@ UNSUPPORTED = {
     "max_tool_calls": "a tool-call budget is not enforced here; omit it rather than rely on it",
     "context_management": "automatic context compaction is not implemented",
     "moderation": "no moderation model runs here, and accepting this would imply "
-                  "input and output filtering that never happens",
+    "input and output filtering that never happens",
     "truncation": "an oversized context fails instead of being truncated, "
-                  "so truncation must be disabled",
+    "so truncation must be disabled",
 }
 
 
@@ -286,8 +284,15 @@ class ResponsesRequest(WireModel):
         return value
 
     @field_validator(
-        "store", "background", "previous_response_id", "conversation", "prompt",
-        "max_tool_calls", "context_management", "moderation", "truncation",
+        "store",
+        "background",
+        "previous_response_id",
+        "conversation",
+        "prompt",
+        "max_tool_calls",
+        "context_management",
+        "moderation",
+        "truncation",
         mode="after",
     )
     @classmethod
@@ -353,7 +358,9 @@ class ResponseObject(WireModel):
     status: Literal["in_progress", "completed", "incomplete", "failed"] = "in_progress"
     error: dict | None = None
     incomplete_details: dict | None = None
-    output: list[OutputMessage | OutputReasoning | FunctionCall | CustomCall] = Field(default_factory=list)
+    output: list[OutputMessage | OutputReasoning | FunctionCall | CustomCall] = Field(
+        default_factory=list
+    )
     model: str
     usage: ResponseUsage | None = None
     store: bool = False

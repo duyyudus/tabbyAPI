@@ -33,7 +33,11 @@ READ = {
 
 def request(**fields):
     return MessagesRequest(
-        **{"model": "test-model", "max_tokens": 256, "messages": [{"role": "user", "content": "hi"}]}
+        **{
+            "model": "test-model",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
         | fields
     )
 
@@ -66,31 +70,60 @@ def sse_events(text):
 
 class InputTests(unittest.TestCase):
     def test_system_blocks_drop_attribution_header(self):
-        data = request(system=[
-            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1; cch=abc;"},
-            {"type": "text", "text": "You are helpful.", "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": "Be brief."},
-        ])
+        data = request(
+            system=[
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1; cch=abc;"},
+                {
+                    "type": "text",
+                    "text": "You are helpful.",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {"type": "text", "text": "Be brief."},
+            ]
+        )
         chat, _ = adapt_request(data)
         self.assertEqual(chat.messages[0].role, "system")
         self.assertEqual(chat.messages[0].content, "You are helpful.\n\nBe brief.")
 
     def test_tool_round_trip_and_reasoning_replay(self):
-        data = request(tools=[READ], messages=[
-            {"role": "user", "content": "read x"},
-            {"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "I should read.", "signature": "sig"},
-                {"type": "text", "text": "Reading."},
-                {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"path": "x"}},
-                {"type": "tool_use", "id": "toolu_2", "name": "Read", "input": {"path": "y"}},
-            ]},
-            {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_2", "content": "Y"},
-                {"type": "tool_result", "tool_use_id": "toolu_1",
-                 "content": [{"type": "text", "text": "X"}], "is_error": False},
-                {"type": "text", "text": "<system-reminder>ok</system-reminder>"},
-            ]},
-        ])
+        data = request(
+            tools=[READ],
+            messages=[
+                {"role": "user", "content": "read x"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "I should read.", "signature": "sig"},
+                        {"type": "text", "text": "Reading."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "Read",
+                            "input": {"path": "x"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_2",
+                            "name": "Read",
+                            "input": {"path": "y"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_2", "content": "Y"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{"type": "text", "text": "X"}],
+                            "is_error": False,
+                        },
+                        {"type": "text", "text": "<system-reminder>ok</system-reminder>"},
+                    ],
+                },
+            ],
+        )
         chat, tools = adapt_request(data)
         roles = [m.role for m in chat.messages]
         self.assertEqual(roles, ["user", "assistant", "tool", "tool", "user"])
@@ -104,70 +137,97 @@ class InputTests(unittest.TestCase):
         self.assertTrue(tools.parallel)
 
     def test_tool_pairing_is_enforced(self):
-        use = {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}]}
+        use = {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}],
+        }
         for messages in (
             [{"role": "user", "content": "x"}, use, {"role": "user", "content": "no result"}],
-            [{"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_9", "content": "x"}]}],
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "toolu_9", "content": "x"}],
+                }
+            ],
             [{"role": "user", "content": "x"}, use],
         ):
             with self.subTest(messages=messages), self.assertRaises(MessagesRequestError):
                 adapt_request(request(tools=[READ], messages=messages))
 
     def test_consecutive_turns_merge_and_mid_conversation_system(self):
-        data = request(messages=[
-            {"role": "user", "content": "a"},
-            {"role": "system", "content": "note"},
-            {"role": "user", "content": [{"type": "text", "text": "b"}]},
-        ])
+        data = request(
+            messages=[
+                {"role": "user", "content": "a"},
+                {"role": "system", "content": "note"},
+                {"role": "user", "content": [{"type": "text", "text": "b"}]},
+            ]
+        )
         chat, _ = adapt_request(data)
         self.assertEqual([m.role for m in chat.messages], ["user"])
         self.assertEqual(chat.messages[0].content, "a\n\nnote\n\nb")
 
     def test_leading_system_message_joins_system_prompt(self):
-        data = request(system="s", messages=[
-            {"role": "system", "content": "t"}, {"role": "user", "content": "u"}])
+        data = request(
+            system="s",
+            messages=[{"role": "system", "content": "t"}, {"role": "user", "content": "u"}],
+        )
         chat, _ = adapt_request(data)
         self.assertEqual(chat.messages[0].content, "s\n\nt")
 
     def test_prefill_continues_final_assistant_message(self):
-        data = request(messages=[
-            {"role": "user", "content": "x"}, {"role": "assistant", "content": "The answer is"}])
+        data = request(
+            messages=[
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": "The answer is"},
+            ]
+        )
         chat, _ = adapt_request(data)
         self.assertTrue(chat.continue_final_message)
         self.assertFalse(chat.add_generation_prompt)
         with self.assertRaises(MessagesRequestError):
-            adapt_request(request(messages=[
-                {"role": "user", "content": "x"}, {"role": "assistant", "content": "trailing "}]))
+            adapt_request(
+                request(
+                    messages=[
+                        {"role": "user", "content": "x"},
+                        {"role": "assistant", "content": "trailing "},
+                    ]
+                )
+            )
 
     def test_thinking_mapping(self):
         chat, _ = adapt_request(request())
         self.assertFalse(chat.enable_thinking)
-        chat, _ = adapt_request(request(thinking={"type": "adaptive"},
-                                        output_config={"effort": "max"}))
+        chat, _ = adapt_request(
+            request(thinking={"type": "adaptive"}, output_config={"effort": "max"})
+        )
         self.assertTrue(chat.enable_thinking)
         self.assertEqual(chat.reasoning_effort, "high")
-        chat, _ = adapt_request(request(max_tokens=4096,
-                                        thinking={"type": "enabled", "budget_tokens": 2048}))
+        chat, _ = adapt_request(
+            request(max_tokens=4096, thinking={"type": "enabled", "budget_tokens": 2048})
+        )
         self.assertEqual(chat.reasoning_budget_tokens, 2048)
         with self.assertRaises(ValidationError):
             request(max_tokens=2048, thinking={"type": "enabled", "budget_tokens": 2048})
         with self.assertRaises(MessagesRequestError):
-            adapt_request(request(tools=[READ], tool_choice={"type": "any"},
-                                  thinking={"type": "adaptive"}))
+            adapt_request(
+                request(tools=[READ], tool_choice={"type": "any"}, thinking={"type": "adaptive"})
+            )
 
     def test_sampling_and_stop_sequences(self):
-        chat, _ = adapt_request(request(temperature=0.5, top_p=0.9, top_k=20,
-                                        stop_sequences=["END"]))
+        chat, _ = adapt_request(
+            request(temperature=0.5, top_p=0.9, top_k=20, stop_sequences=["END"])
+        )
         self.assertEqual((chat.temperature, chat.top_p, chat.top_k), (0.5, 0.9, 20))
         self.assertEqual(chat.stop, ["END"])
         self.assertEqual(chat.max_tokens, 256)
 
     def test_tool_choice(self):
-        chat, tools = adapt_request(request(tools=[READ, {**READ, "name": "Write"}],
-                                            tool_choice={"type": "tool", "name": "Write",
-                                                         "disable_parallel_tool_use": True}))
+        chat, tools = adapt_request(
+            request(
+                tools=[READ, {**READ, "name": "Write"}],
+                tool_choice={"type": "tool", "name": "Write", "disable_parallel_tool_use": True},
+            )
+        )
         self.assertEqual([t.function.name for t in chat.tools], ["Write"])
         self.assertIn("Write", chat.messages[0].content)
         self.assertFalse(tools.parallel)
@@ -181,13 +241,28 @@ class InputTests(unittest.TestCase):
         data = request(
             metadata={"user_id": "u"},
             context_management={"edits": []},
-            tools=[{**READ, "cache_control": {"type": "ephemeral"}, "defer_loading": False,
-                    "eager_input_streaming": True},
-                   {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
-                {"type": "tool_reference", "tool_name": "Read"},
-            ]}],
+            tools=[
+                {
+                    **READ,
+                    "cache_control": {"type": "ephemeral"},
+                    "defer_loading": False,
+                    "eager_input_streaming": True,
+                },
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "hi",
+                            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                        },
+                        {"type": "tool_reference", "tool_name": "Read"},
+                    ],
+                }
+            ],
         )
         chat, _ = adapt_request(data)
         self.assertEqual([t.function.name for t in chat.tools], ["Read"])
@@ -205,26 +280,78 @@ class InputTests(unittest.TestCase):
             with self.subTest(fields=fields), self.assertRaises(ValidationError):
                 request(**fields)
         for fields in (
-            {"messages": [{"role": "user", "content": [
-                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                                "data": "AA=="}}]}]},
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": "AA==",
+                                },
+                            }
+                        ],
+                    }
+                ]
+            },
             {"messages": [{"role": "user", "content": [{"type": "mystery"}]}]},
-            {"messages": [{"role": "user", "content": [{"type": "image", "source": {
-                "type": "base64", "media_type": "image/png", "data": "AA=="}}]}]},
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "AA==",
+                                },
+                            }
+                        ],
+                    }
+                ]
+            },
             {"tools": [{"name": "t", "input_schema": {"type": "string"}}]},
             {"tools": [READ, READ]},
-            {"tools": [READ], "output_config": {"format": {"type": "json_schema",
-                                                           "schema": {"type": "object"}}}},
+            {
+                "tools": [READ],
+                "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}},
+            },
         ):
             with self.subTest(fields=fields), self.assertRaises(MessagesRequestError):
                 adapt_request(request(**fields))
 
     def test_images_and_documents(self):
-        chat, _ = adapt_request(request(messages=[{"role": "user", "content": [
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
-            {"type": "document", "title": "Doc", "source": {"type": "text", "data": "body"}},
-            {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
-        ]}]), vision=True)
+        chat, _ = adapt_request(
+            request(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "AA==",
+                                },
+                            },
+                            {
+                                "type": "document",
+                                "title": "Doc",
+                                "source": {"type": "text", "data": "body"},
+                            },
+                            {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+                        ],
+                    }
+                ]
+            ),
+            vision=True,
+        )
         parts = chat.messages[0].content
         self.assertEqual(parts[0].image_url.url, "data:image/png;base64,AA==")
         self.assertEqual(parts[2].text, "Doc\n\nbody")
@@ -249,46 +376,75 @@ class AccumulatorTests(unittest.TestCase):
 
     def test_thinking_text_and_tool_stream(self):
         accumulator = MessagesAccumulator(self.data, self.tools, "test-model", 10)
-        events = self.run_packets(accumulator, [
-            packet([(REASONING, "hmm")]),
-            packet([(CONTENT, "\n\n"), (CONTENT, "Let me read.")]),
-            packet([(TOOL, tool_text("Read", {"path": "x"}))]),
-            packet([(CONTENT, "\n")]),
-        ], finish())
+        events = self.run_packets(
+            accumulator,
+            [
+                packet([(REASONING, "hmm")]),
+                packet([(CONTENT, "\n\n"), (CONTENT, "Let me read.")]),
+                packet([(TOOL, tool_text("Read", {"path": "x"}))]),
+                packet([(CONTENT, "\n")]),
+            ],
+            finish(),
+        )
         kinds = [e["type"] for e in events]
-        self.assertEqual(kinds, [
-            "message_start",
-            "content_block_start", "content_block_delta",
-            "content_block_delta", "content_block_stop",
-            "content_block_start", "content_block_delta", "content_block_stop",
-            "content_block_start", "content_block_delta", "content_block_stop",
-            "message_delta", "message_stop",
-        ])
+        self.assertEqual(
+            kinds,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+        )
         self.assertEqual(events[3]["delta"]["type"], "signature_delta")
         self.assertEqual(events[6]["delta"]["text"], "\n\nLet me read.")
         self.assertEqual(events[8]["content_block"]["type"], "tool_use")
         self.assertTrue(events[8]["content_block"]["id"].startswith("toolu_"))
         self.assertEqual(json.loads(events[9]["delta"]["partial_json"]), {"path": "x"})
-        self.assertEqual([e.get("index") for e in events[1:11] if "index" in e],
-                         [0, 0, 0, 0, 1, 1, 1, 2, 2, 2])
+        self.assertEqual(
+            [e.get("index") for e in events[1:11] if "index" in e], [0, 0, 0, 0, 1, 1, 1, 2, 2, 2]
+        )
         self.assertEqual(events[-2]["delta"], {"stop_reason": "tool_use", "stop_sequence": None})
-        self.assertEqual(events[-2]["usage"], {
-            "input_tokens": 7, "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 3, "output_tokens": 5})
+        self.assertEqual(
+            events[-2]["usage"],
+            {
+                "input_tokens": 7,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 3,
+                "output_tokens": 5,
+            },
+        )
         self.assertEqual(events[0]["message"]["usage"]["input_tokens"], 10)
 
     def test_thinking_hidden_unless_requested(self):
         data = request()
         _, tools = adapt_request(data)
-        events = self.run_packets(MessagesAccumulator(data, tools, "m", 1),
-                                  [packet([(REASONING, "secret"), (CONTENT, "hi")])], finish())
-        self.assertEqual([e["content_block"]["type"] for e in events
-                          if e["type"] == "content_block_start"], ["text"])
+        events = self.run_packets(
+            MessagesAccumulator(data, tools, "m", 1),
+            [packet([(REASONING, "secret"), (CONTENT, "hi")])],
+            finish(),
+        )
+        self.assertEqual(
+            [e["content_block"]["type"] for e in events if e["type"] == "content_block_start"],
+            ["text"],
+        )
 
     def test_omitted_thinking_display(self):
         data = request(thinking={"type": "adaptive", "display": "omitted"})
-        events = self.run_packets(MessagesAccumulator(data, self.tools, "m", 1),
-                                  [packet([(REASONING, "secret")])], finish())
+        events = self.run_packets(
+            MessagesAccumulator(data, self.tools, "m", 1),
+            [packet([(REASONING, "secret")])],
+            finish(),
+        )
         self.assertFalse(any(e.get("delta", {}).get("type") == "thinking_delta" for e in events))
         self.assertTrue(any(e.get("delta", {}).get("type") == "signature_delta" for e in events))
 
@@ -302,10 +458,14 @@ class AccumulatorTests(unittest.TestCase):
         data = request(stop_sequences=["END"])
         for generation, reason, sequence in cases:
             with self.subTest(reason=reason):
-                events = self.run_packets(MessagesAccumulator(data, self.tools, "m", 1),
-                                          [packet([(CONTENT, "x")])], generation)
-                self.assertEqual(events[-2]["delta"],
-                                 {"stop_reason": reason, "stop_sequence": sequence})
+                events = self.run_packets(
+                    MessagesAccumulator(data, self.tools, "m", 1),
+                    [packet([(CONTENT, "x")])],
+                    generation,
+                )
+                self.assertEqual(
+                    events[-2]["delta"], {"stop_reason": reason, "stop_sequence": sequence}
+                )
 
     def test_limit_never_releases_tool(self):
         events = self.run_packets(
@@ -323,11 +483,19 @@ class AccumulatorTests(unittest.TestCase):
             accumulator.finish(finish())
 
     def test_disabled_parallel_tool_use_keeps_first_call(self):
-        data = request(tools=[READ], tool_choice={"type": "auto", "disable_parallel_tool_use": True})
+        data = request(
+            tools=[READ], tool_choice={"type": "auto", "disable_parallel_tool_use": True}
+        )
         _, tools = adapt_request(data)
-        events = self.run_packets(MessagesAccumulator(data, tools, "m", 1), [
-            packet([(TOOL, tool_text("Read", {"path": "a"}) + tool_text("Read", {"path": "b"}))]),
-        ], finish())
+        events = self.run_packets(
+            MessagesAccumulator(data, tools, "m", 1),
+            [
+                packet(
+                    [(TOOL, tool_text("Read", {"path": "a"}) + tool_text("Read", {"path": "b"}))]
+                ),
+            ],
+            finish(),
+        )
         starts = [e for e in events if e["type"] == "content_block_start"]
         self.assertEqual(len(starts), 1)
 
@@ -359,8 +527,11 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
             item.stop()
 
     def body(self, **fields):
-        return {"model": "test-model", "max_tokens": 64,
-                "messages": [{"role": "user", "content": "hi"}]} | fields
+        return {
+            "model": "test-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        } | fields
 
     async def test_json_and_sse_agree(self):
         self.container.chunks = [{"text": "<think>hmm</think>hello"}, finish()]
@@ -404,16 +575,22 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["type"], "error")
         self.assertEqual(body["error"]["type"], "invalid_request_error")
 
-        response = await self.client.post("/v1/messages", json=self.body(
-            messages=[{"role": "user", "content": [{"type": "text"}]}]))
-        self.assertEqual(response.json()["error"]["message"],
-                         "messages.0.content.0.text: Field required")
+        response = await self.client.post(
+            "/v1/messages",
+            json=self.body(messages=[{"role": "user", "content": [{"type": "text"}]}]),
+        )
+        self.assertEqual(
+            response.json()["error"]["message"], "messages.0.content.0.text: Field required"
+        )
 
         response = await self.client.post("/v1/messages", content=b"{not json")
         self.assertEqual(response.status_code, 400)
 
-        with patch.object(model, "check_context_length",
-                          side_effect=ContextLengthHTTPException("Prompt length 9 exceeds 8")):
+        with patch.object(
+            model,
+            "check_context_length",
+            side_effect=ContextLengthHTTPException("Prompt length 9 exceeds 8"),
+        ):
             response = await self.client.post("/v1/messages", json=self.body())
         self.assertEqual(response.status_code, 400)
         self.assertTrue(response.json()["error"]["message"].startswith("prompt is too long"))
@@ -422,8 +599,9 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         app = make_app()
         app.dependency_overrides.clear()
         with patch("common.auth.DISABLE_AUTH", False), patch("common.auth.AUTH_KEYS", None):
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
-                                         base_url="http://test") as client:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
                 response = await client.post("/v1/messages", json=self.body())
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"]["type"], "authentication_error")
@@ -441,8 +619,13 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.container.closed)
 
     async def test_count_tokens(self):
-        response = await self.client.post("/v1/messages/count_tokens", json={
-            "model": "test-model", "messages": [{"role": "user", "content": "one two three"}]})
+        response = await self.client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "one two three"}],
+            },
+        )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertGreater(response.json()["input_tokens"], 0)
 
@@ -457,29 +640,46 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         except ImportError:
             sdk_httpx = httpx
         client = anthropic.AsyncAnthropic(
-            api_key="x", base_url="http://test",
+            api_key="x",
+            base_url="http://test",
             http_client=sdk_httpx.AsyncClient(transport=sdk_httpx.ASGITransport(app=make_app())),
         )
-        self.container.chunks = [{"text": "<think>plan</think>Reading."
-                                  + tool_text("Read", {"path": "x"})}, finish()]
+        self.container.chunks = [
+            {"text": "<think>plan</think>Reading." + tool_text("Read", {"path": "x"})},
+            finish(),
+        ]
         message = await client.messages.create(
-            model="test-model", max_tokens=64, tools=[READ],
+            model="test-model",
+            max_tokens=64,
+            tools=[READ],
             thinking={"type": "adaptive"},
             messages=[{"role": "user", "content": "read x"}],
         )
         self.assertEqual([b.type for b in message.content], ["thinking", "text", "tool_use"])
         self.assertEqual(message.content[2].input, {"path": "x"})
 
-        self.container.chunks = [{"text": "<think>plan</think>Reading."
-                                  + tool_text("Read", {"path": "x"})}, finish()]
+        self.container.chunks = [
+            {"text": "<think>plan</think>Reading." + tool_text("Read", {"path": "x"})},
+            finish(),
+        ]
         async with client.messages.stream(
-            model="test-model", max_tokens=64, tools=[READ], thinking={"type": "adaptive"},
+            model="test-model",
+            max_tokens=64,
+            tools=[READ],
+            thinking={"type": "adaptive"},
             messages=[
                 {"role": "user", "content": "read x"},
                 {"role": "assistant", "content": [c.model_dump() for c in message.content]},
-                {"role": "user", "content": [{"type": "tool_result",
-                                              "tool_use_id": message.content[2].id,
-                                              "content": "file"}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": message.content[2].id,
+                            "content": "file",
+                        }
+                    ],
+                },
             ],
         ) as stream:
             text = "".join([chunk async for chunk in stream.text_stream])
@@ -491,7 +691,8 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.usage.cache_read_input_tokens, 3)
 
         count = await client.messages.count_tokens(
-            model="test-model", messages=[{"role": "user", "content": "a b"}])
+            model="test-model", messages=[{"role": "user", "content": "a b"}]
+        )
         self.assertGreater(count.input_tokens, 0)
 
         self.container.chunks = [finish()]

@@ -354,7 +354,8 @@ def adapt_request(data, vision=False):
             # carry a summary; opaque encrypted content cannot be reconstructed.
             parts = item.content or item.summary
             pending_reasoning.extend(
-                part["text"] for part in parts
+                part["text"]
+                for part in parts
                 if isinstance(part, dict) and isinstance(part.get("text"), str)
             )
             continue

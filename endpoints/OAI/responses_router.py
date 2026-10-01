@@ -42,11 +42,7 @@ def param_path(location, body):
         elif isinstance(node, dict) and segment in node:
             node = node[segment]
             parts.append(segment)
-        elif (
-            index == len(segments) - 1
-            and isinstance(node, dict)
-            and "[" not in segment
-        ):
+        elif index == len(segments) - 1 and isinstance(node, dict) and "[" not in segment:
             # A required field is absent from the body, yet still names the fault.
             parts.append(segment)
     return parts
@@ -56,7 +52,7 @@ def error_message(error):
     """Pydantic prefixes a raised ValueError; the reason alone is the message."""
     message = error["msg"]
     prefix = "Value error, "
-    return message[len(prefix):] if message.startswith(prefix) else message
+    return message[len(prefix) :] if message.startswith(prefix) else message
 
 
 def describe_validation_error(exc):

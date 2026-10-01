@@ -138,19 +138,23 @@ class ResponsesAccumulator:
         if self.reasoning is None:
             self.reasoning = OutputReasoning(content=[ReasoningText()])
             self.response.output.append(self.reasoning)
-            events.append(self.event(
-                "response.output_item.added",
-                output_index=len(self.response.output) - 1,
-                item=self.reasoning.model_dump(),
-            ))
+            events.append(
+                self.event(
+                    "response.output_item.added",
+                    output_index=len(self.response.output) - 1,
+                    item=self.reasoning.model_dump(),
+                )
+            )
         self.reasoning.content[0].text += text
-        events.append(self.event(
-            "response.reasoning_text.delta",
-            output_index=len(self.response.output) - 1,
-            item_id=self.reasoning.id,
-            content_index=0,
-            delta=text,
-        ))
+        events.append(
+            self.event(
+                "response.reasoning_text.delta",
+                output_index=len(self.response.output) - 1,
+                item_id=self.reasoning.id,
+                content_index=0,
+                delta=text,
+            )
+        )
         return events
 
     def close_reasoning(self, status="completed"):
@@ -163,8 +167,10 @@ class ResponsesAccumulator:
         return [
             self.event(
                 "response.reasoning_text.done",
-                output_index=index, item_id=item.id,
-                content_index=0, text=item.content[0].text,
+                output_index=index,
+                item_id=item.id,
+                content_index=0,
+                text=item.content[0].text,
             ),
             self.event("response.output_item.done", output_index=index, item=item.model_dump()),
         ]
