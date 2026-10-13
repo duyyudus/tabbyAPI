@@ -16,3 +16,5 @@ Have issues? Check out the [FAQ](https://github.com/theroyallab/tabbyAPI/wiki/05
 
 - [Responses API](11.-Responses-API.md): stateless generation, streaming, and agent tools.
 - [Anthropic Messages API](12.-Anthropic-Messages-API.md): Messages endpoints for Claude Code and Anthropic SDKs.
+
+Running an AMD GPU? See the [ROCm](https://github.com/theroyallab/tabbyAPI/wiki/11.-ROCm) page.

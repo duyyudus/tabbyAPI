@@ -181,6 +181,7 @@ def _compose_serialize_stream_chunk(
     model_name: Optional[str] = None,
     suppress_finish: bool = False,
     timings: Optional[Timings] = None,
+    include_role: bool = False,
 ) -> tuple[str, dict, Optional[str], bool]:
     """
     Compose a chat completion stream chunk from generation produced by _chat_stream_collector
@@ -202,6 +203,12 @@ def _compose_serialize_stream_chunk(
         delta["reasoning_content"] = delta_reasoning_content
     if delta_tool:
         delta["tool_calls"] = delta_tool
+
+    # The first delta of a choice names the role, as OpenAI does. Clients that
+    # infer the message type from it (LangChain's ChatOpenAI) otherwise build a
+    # generic chunk and drop the tool_calls.
+    if include_role and delta:
+        delta = {"role": "assistant", **delta}
 
     choice = {
         "index": generation.get("index"),
@@ -692,15 +699,16 @@ async def iter_generation_events(
             xlogger.debug(
                 "A reasoning budget was requested but the model has no reasoning format; ignoring."
             )
-        elif params.json_schema or params.regex_pattern or params.grammar_string:
-            # Injection permanently disables a job's filters
-            xlogger.warning(
-                "The reasoning budget is ignored because the request uses "
-                "constrained generation (json_schema, regex_pattern or "
-                "grammar_string)."
-            )
-            budget_injection = None
     reasoning_tokens = 0
+
+    # The backend holds one set of sampler settings for reasoning and one for
+    # content (which alone carries any grammar); it's told here when the
+    # response moves between the two
+    phase_applied = parser.in_reasoning
+
+    # A JSON answer may be preceded by the blank line models put after their
+    # reasoning (the grammar allows it); the client gets the JSON alone
+    strip_content_lead = bool(params.json_schema)
 
     new_generation = None
     try:
@@ -710,9 +718,7 @@ async def iter_generation_events(
             params,
             disconnect_handler,
             mm_embeddings,
-            filter_trigger=(
-                mc.reasoning_end_token if use_think and start_in_reasoning_mode else None
-            ),
+            reasoning_phase=phase_applied,
             label=label,
         )
         async for generation in new_generation:
@@ -729,6 +735,22 @@ async def iter_generation_events(
             events = parser.feed(text) if text else []
             if finish_reason:
                 events += parser.finish()
+
+            if strip_content_lead:
+                stripped = []
+                for channel, sub in events:
+                    if channel == CONTENT and strip_content_lead:
+                        sub = sub.lstrip()
+                        strip_content_lead = not sub
+                        if not sub:
+                            continue
+                    stripped.append((channel, sub))
+                events = stripped
+
+            if parser.in_reasoning != phase_applied and not finish_reason:
+                # Retried on the next chunk if the backend can't switch yet
+                if mc.set_generation_phase(request_id, parser.in_reasoning):
+                    phase_applied = parser.in_reasoning
 
             # Count reasoning tokens and force the end of the reasoning phase
             # when the budget is exhausted. Attribution is approximate: a
@@ -922,6 +944,9 @@ async def stream_generate_chat_completion(
         # For aggregating usage
         usage_stats_list = []
 
+        # Choice indices whose role has been sent
+        role_sent = set()
+
         # Create a stream collector for each choice
         remaining_n = data.n
         for idx in range(0, data.n):
@@ -958,14 +983,17 @@ async def stream_generate_chat_completion(
             suppress_finish = return_usage and remaining_n == 1
 
             # Create and serialize chunk
-            chunk, _, finish_reason, is_empty = _compose_serialize_stream_chunk(
+            chunk, chunk_dict, finish_reason, is_empty = _compose_serialize_stream_chunk(
                 request.state.id,
                 generation,
                 model_path.name,
                 suppress_finish,
                 None if suppress_finish else timings,
+                include_role=generation.get("index") not in role_sent,
             )
             if not is_empty:
+                if "role" in chunk_dict["choices"][0]["delta"]:
+                    role_sent.add(generation.get("index"))
                 yield chunk
 
             # Send usage chunk on completing last choice
