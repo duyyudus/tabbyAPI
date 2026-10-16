@@ -29,7 +29,9 @@ class ConfigOverrideConfig(BaseConfigModel):
     """Model for overriding a provided config file."""
 
     # TODO: convert this to a pathlib.path?
-    config: Optional[str] = Field(None, description="Path to an overriding config.yml file")
+    config: Optional[str] = Field(
+        None, description="Path to an overriding config.yml file; command line values override it"
+    )
 
     _metadata: Metadata = PrivateAttr(Metadata(include_in_config=False))
 

@@ -218,14 +218,15 @@ class TabbyConfig(TabbyConfigModel):
         if config_override:
             logger.info(f"Using config file {config_override}")
             cfg = self._from_file(pathlib.Path(config_override))
-            return cfg  # Return early if loading from file
 
+        # Command line values are laid over the config file
+        overrides = {}
         for key in TabbyConfigModel.model_fields.keys():
             override = args.get(key)
             if override:
-                cfg[key] = override
+                overrides[key] = override
 
-        return cfg
+        return deep_merge_dicts(cfg, overrides)
 
     def _from_environment(self):
         """loads configuration from environment variables"""
