@@ -209,10 +209,86 @@ async function copyText(text) {
 // ---------------------------------------------------------------------------
 // Markdown
 
+// highlight.js and KaTeX are loaded the first time a reply needs them, so a
+// page without code or math never fetches them. Once one arrives, the replies
+// on screen are formatted again with it.
+const LIBRARIES = {
+  highlight: {
+    scripts: [
+      "vendor/highlight.js/highlight.min.js",
+      // Beyond the common languages the main file bundles
+      ...["dockerfile", "powershell", "cmake", "latex"].map((l) => `vendor/highlight.js/languages/${l}.min.js`),
+    ],
+    styles: [],
+  },
+  katex: { scripts: ["vendor/katex/katex.min.js"], styles: ["vendor/katex/katex.min.css"] },
+};
+const libraryLoads = {};
+
+function loadLibrary(name) {
+  if (libraryLoads[name]) return;
+  const { scripts, styles } = LIBRARIES[name];
+  const load = (tag, attrs) =>
+    new Promise((resolve, reject) => {
+      const node = el(tag, attrs);
+      node.addEventListener("load", resolve);
+      node.addEventListener("error", () => reject(new Error(`Could not load ${attrs.src || attrs.href}`)));
+      document.head.append(node);
+    });
+  libraryLoads[name] = (async () => {
+    // In order: the language files register with the main highlight.js file
+    for (const src of scripts) await load("script", { src });
+    await Promise.all(styles.map((href) => load("link", { rel: "stylesheet", href })));
+  })().then(reformatReplies, (e) => console.warn(e.message));
+}
+
+// The message each formatted reply on screen shows, to format it again
+const formattedContent = new WeakMap();
+
+function reformatReplies() {
+  const stick = nearBottom();
+  for (const node of document.querySelectorAll("#messages .content.markdown")) {
+    const msg = formattedContent.get(node);
+    if (msg) setContent(node, msg);
+  }
+  if (stick) scrollToBottom();
+}
+
+// Highlighted code by language and source. Replies re-render on every
+// streamed token, so code that hasn't changed isn't highlighted again
+const highlightedCode = new Map();
+
+function highlightCode(code, lang) {
+  lang = lang.toLowerCase();
+  if (!lang) return "";
+  const hljs = window.hljs;
+  if (!hljs) {
+    loadLibrary("highlight");
+    return "";
+  }
+  if (!hljs.getLanguage(lang)) return "";
+
+  const key = `${lang}\n${code}`;
+  let html = highlightedCode.get(key);
+  if (html === undefined) {
+    try {
+      html = hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
+    } catch {
+      html = "";
+    }
+  } else highlightedCode.delete(key);
+  highlightedCode.set(key, html);
+  if (highlightedCode.size > 64) highlightedCode.delete(highlightedCode.keys().next().value);
+  return html;
+}
+
 // markdown-it (vendor/markdown-it.min.js) with its safe defaults: HTML in a
 // reply is shown as text, and javascript:, vbscript: and file: links are
 // refused. Single newlines are kept as line breaks, as models tend to mean them.
-const markdown = window.markdownit ? window.markdownit({ linkify: true, breaks: true }) : null;
+// highlight.js output is escaped HTML, with spans marking the tokens.
+const markdown = window.markdownit
+  ? window.markdownit({ linkify: true, breaks: true, highlight: highlightCode })
+  : null;
 
 if (markdown) {
   // Links open in a new tab, without a handle back to this page
@@ -237,6 +313,132 @@ if (markdown) {
     const href = markdown.utils.escapeHtml(src);
     return `<a class="remote-image" href="${href}" target="_blank" rel="noopener noreferrer">${markdown.utils.escapeHtml(alt)}</a>`;
   };
+}
+
+// Math, typeset by KaTeX: $…$ and \(…\) inline, $$…$$ and \[…\] displayed,
+// either on lines of their own or within a paragraph. Single dollars follow
+// Pandoc's rule so prices stay text: no space just inside either one, and no
+// digit right after the closing one ("$5 and $10" isn't math).
+const typesetMath = new Map();
+
+function renderMath(tex, display, source) {
+  const katex = window.katex;
+  if (!katex) {
+    loadLibrary("katex");
+    return `<span class="math-pending">${markdown.utils.escapeHtml(source)}</span>`;
+  }
+
+  const key = `${display ? "D" : "I"}${tex}`;
+  let html = typesetMath.get(key);
+  if (html === undefined) {
+    try {
+      // Bad TeX comes out as its source in the error color, with the error as a tooltip.
+      // Without trust, commands like \href and \includegraphics are refused
+      html = katex.renderToString(tex, { displayMode: display, throwOnError: false, strict: "ignore" });
+    } catch {
+      html = `<span class="math-pending">${markdown.utils.escapeHtml(source)}</span>`;
+    }
+  } else typesetMath.delete(key);
+  typesetMath.set(key, html);
+  if (typesetMath.size > 256) typesetMath.delete(typesetMath.keys().next().value);
+  return html;
+}
+
+const MATH_DELIMITERS = [
+  ["\\(", "\\)", false],
+  ["\\[", "\\]", true],
+  ["$$", "$$", true],
+  ["$", "$", false],
+];
+
+function mathInline(state, silent) {
+  const src = state.src;
+  const start = state.pos;
+  const delimiters = MATH_DELIMITERS.find(([open]) => src.startsWith(open, start));
+  if (!delimiters) return false;
+  const [open, close, display] = delimiters;
+  const from = start + open.length;
+
+  let end;
+  if (open === "$") {
+    if (!src[from] || /[\s$]/.test(src[from])) return false;
+    end = from;
+    for (;;) {
+      end = src.indexOf("$", end + 1);
+      if (end < 0) return false;
+      if (src[end - 1] === "\\") continue;
+      if (!/\s/.test(src[end - 1]) && !/[0-9]/.test(src[end + 1] || "")) break;
+      // Any other dollar means this one was a price: "$5 and $10"
+      return false;
+    }
+    // Nor does math run into a code span: "$5 or `$x`"
+    if (src.slice(from, end).includes("`")) return false;
+  } else {
+    end = src.indexOf(close, from);
+    if (end < 0) return false;
+  }
+
+  const tex = src.slice(from, end);
+  if (!tex.trim()) return false;
+  if (!silent) {
+    const token = state.push(display ? "math_display" : "math_inline", "", 0);
+    token.content = tex;
+    token.markup = open;
+    token.info = close;
+  }
+  state.pos = end + close.length;
+  return true;
+}
+
+// $$ or \[ starting a line, up to a line that ends with $$ or \]
+function mathBlock(state, startLine, endLine, silent) {
+  if (state.sCount[startLine] - state.blkIndent >= 4) return false;
+  const lineText = (line) => state.src.slice(state.bMarks[line] + state.tShift[line], state.eMarks[line]);
+  const first = lineText(startLine);
+  const delimiters = MATH_DELIMITERS.find(([open, , display]) => display && first.startsWith(open));
+  if (!delimiters) return false;
+  const [open, close] = delimiters;
+
+  const lines = [first.slice(open.length)];
+  let line = startLine;
+  for (;;) {
+    const text = lines[lines.length - 1].trimEnd();
+    if (text.endsWith(close) && !(line === startLine && text.length < close.length)) {
+      lines[lines.length - 1] = text.slice(0, -close.length);
+      break;
+    }
+    if (++line >= endLine) return false;
+    lines.push(lineText(line));
+  }
+  // "$$a$$ and more" on one line is inline math in a paragraph, not a block
+  if (line === startLine && first.trimEnd() !== `${open}${lines[0]}${close}`) return false;
+
+  const tex = lines.join("\n");
+  if (!tex.trim()) return false;
+  if (silent) return true;
+  state.line = line + 1;
+  const token = state.push("math_block", "", 0);
+  token.block = true;
+  token.content = tex;
+  token.markup = open;
+  token.info = close;
+  token.map = [startLine, state.line];
+  return true;
+}
+
+if (markdown) {
+  // Ahead of backslash escapes, which would turn \( into (
+  markdown.inline.ruler.before("escape", "math_inline", mathInline);
+  // Ahead of every other block rule: the lines of a formula can look like Markdown, and
+  // an "=" or "-" line would otherwise make a heading of the lines above it
+  markdown.block.ruler.before("table", "math_block", mathBlock, {
+    alt: ["paragraph", "reference", "blockquote", "list"],
+  });
+  const source = (token) => `${token.markup}${token.content}${token.info}`;
+  markdown.renderer.rules.math_inline = (tokens, idx) => renderMath(tokens[idx].content, false, source(tokens[idx]));
+  markdown.renderer.rules.math_display = (tokens, idx) => renderMath(tokens[idx].content, true, source(tokens[idx]));
+  markdown.renderer.rules.math_block = (tokens, idx) =>
+    `<div class="math-block">${renderMath(tokens[idx].content, true, source(tokens[idx]))}</div>\n`;
 }
 
 // Code blocks get a header with the language and a copy button. SVG code
@@ -387,6 +589,7 @@ function addSvgPreviews(node, streaming) {
 function setContent(node, msg) {
   if (markdown && settings.markdown && msg.role === "assistant") {
     node.classList.add("markdown");
+    formattedContent.set(node, msg);
     node.innerHTML = markdown.render(msg.content);
     addSvgPreviews(node, state.generating?.message === msg);
   } else {
@@ -1495,6 +1698,56 @@ async function parseLoadOptions() {
   return (await res.json()).settings;
 }
 
+// Save the load options as the target model's tabby_config.yml. The server
+// leaves out whatever only repeats config.yml's use_as_default
+async function saveLoadOptions() {
+  const message = $("model-message");
+  message.classList.remove("error");
+  let options;
+  try {
+    options = await parseLoadOptions();
+  } catch (e) {
+    message.textContent = e.message.startsWith("Load options") ? e.message : `Load options: ${e.message}`;
+    message.classList.add("error");
+    return;
+  }
+
+  const named = typeof options.model_name === "string" ? options.model_name.trim() : "";
+  const name = named || listTarget();
+  if (!name) return;
+  const question =
+    `Save these load options to the tabby_config.yml of ${name}?\n\n` +
+    "Options that only repeat config.yml's use_as_default are left out, unless the file already has them. " +
+    "An existing file is kept as tabby_config.bak.";
+  if (!confirm(question)) return;
+
+  const button = $("save-load-options");
+  button.disabled = true;
+  try {
+    const res = await api("/v1/model/load_config/save", { method: "POST", body: { model_name: name, settings: options } });
+    const data = await res.json();
+    const { draft_model: draft = {}, ...rest } = data.saved;
+    const count = Object.keys(rest).length + Object.keys(draft).length;
+    const backup = data.backup ? ` The previous file is kept as ${data.backup}.` : "";
+    if (data.removed) {
+      message.textContent = `Removed the tabby_config.yml of ${name}, since every option matches use_as_default.${backup}`;
+    } else if (!count) {
+      message.textContent = "Nothing to save: every option matches use_as_default.";
+    } else {
+      message.textContent = `Saved ${count} option${count === 1 ? "" : "s"} to the tabby_config.yml of ${name}.${backup}`;
+    }
+
+    // Show what applies to the model now
+    editedOptions.delete(name);
+    if (name === optionsTarget) syncLoadOptions(true);
+  } catch (e) {
+    message.textContent = e.message;
+    message.classList.add("error");
+  } finally {
+    updateModelButtons();
+  }
+}
+
 function rememberModel(name) {
   if (state.models.some((m) => m.id === name)) return;
   recentModels = [name, ...recentModels.filter((n) => n !== name)].slice(0, 8);
@@ -1510,6 +1763,7 @@ function updateModelButtons() {
   loadButton.disabled = !admin || state.loading || !name;
   $("load-target").textContent = admin && name ? `Load target: ${name}` + (optionsModelName() ? " (from load options)" : "") : "";
   $("unload-model").disabled = !admin || state.loading || !state.currentModel;
+  $("save-load-options").disabled = !admin || !name;
 }
 
 function renderModelInfo() {
@@ -1794,6 +2048,39 @@ function closeDrawers() {
   $("scrim").hidden = true;
 }
 
+// The buttons at either end of the top bar hide and show the side panels, or
+// open them as drawers on screens too narrow to fit them alongside the chat
+const SIDE_PANELS = {
+  sidebar: { setting: "hideSidebar", label: "chats", drawer: matchMedia("(max-width: 760px)") },
+  panel: { setting: "hidePanel", label: "settings", drawer: matchMedia("(max-width: 1100px)") },
+};
+
+function toggleSidePanel(name) {
+  const side = SIDE_PANELS[name];
+  if (side.drawer.matches) {
+    const drawer = $(name);
+    const open = !drawer.classList.contains("open");
+    closeDrawers();
+    drawer.classList.toggle("open", open);
+    $("scrim").hidden = !open;
+  } else {
+    settings[side.setting] = !settings[side.setting];
+    save("settings", settings);
+    applySidePanels();
+  }
+}
+
+function applySidePanels() {
+  for (const [name, side] of Object.entries(SIDE_PANELS)) {
+    const hidden = !!settings[side.setting];
+    document.documentElement.classList.toggle(`${name}-hidden`, hidden);
+    const label = side.drawer.matches || hidden ? `Show ${side.label}` : `Hide ${side.label}`;
+    const button = document.querySelector(`[data-drawer="${name}"]`);
+    button.title = label;
+    button.setAttribute("aria-label", label);
+  }
+}
+
 function bindEvents() {
   $("new-chat").addEventListener("click", newChat);
 
@@ -1889,6 +2176,7 @@ function bindEvents() {
     updateModelButtons();
   });
   $("reset-load-options").addEventListener("click", () => syncLoadOptions(true));
+  $("save-load-options").addEventListener("click", saveLoadOptions);
   $("load-model").addEventListener("click", loadModel);
   $("unload-model").addEventListener("click", unloadModel);
   $("preset-select").addEventListener("change", switchPreset);
@@ -1924,14 +2212,9 @@ function bindEvents() {
   });
 
   for (const button of document.querySelectorAll("[data-drawer]")) {
-    button.addEventListener("click", () => {
-      const drawer = $(button.dataset.drawer);
-      const open = !drawer.classList.contains("open");
-      closeDrawers();
-      drawer.classList.toggle("open", open);
-      $("scrim").hidden = !open;
-    });
+    button.addEventListener("click", () => toggleSidePanel(button.dataset.drawer));
   }
+  for (const side of Object.values(SIDE_PANELS)) side.drawer.addEventListener("change", applySidePanels);
   $("scrim").addEventListener("click", closeDrawers);
 
   // Another tab may have changed the chats; pick up the session list
@@ -1965,6 +2248,7 @@ async function init() {
   renderThemeMenu();
   applyTheme();
   applyFormatting();
+  applySidePanels();
   bindEvents();
 
   const current = load("current", null);

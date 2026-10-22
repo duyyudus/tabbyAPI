@@ -46,6 +46,16 @@
   --code-block-fg: #ececf1;
   --code-head-bg: #343541;
   --code-head-fg: #acacbe;
+  /* Syntax highlighting in code blocks, here for dark ones */
+  --hl-comment: #8b8d98;
+  --hl-keyword: #c678dd;
+  --hl-string: #98c379;
+  --hl-number: #d19a66;
+  --hl-title: #61afef;
+  --hl-type: #e5c07b;
+  --hl-attr: #d19a66;
+  --hl-meta: #56b6c2;
+  --hl-variable: #e06c75;
 
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, "Helvetica Neue", Arial, sans-serif;
@@ -494,6 +504,33 @@ svg {
   white-space: pre;
 }
 
+/* highlight.js marks tokens with hljs-* classes; each theme colors them with its --hl-* palette */
+.markdown pre :is(.hljs-comment, .hljs-quote) { color: var(--hl-comment); font-style: italic; }
+.markdown pre :is(.hljs-keyword, .hljs-selector-tag, .hljs-doctag, .hljs-name) { color: var(--hl-keyword); }
+.markdown pre :is(.hljs-string, .hljs-regexp, .hljs-symbol, .hljs-char, .hljs-link, .hljs-addition,
+  .hljs-selector-attr, .hljs-selector-pseudo) { color: var(--hl-string); }
+.markdown pre :is(.hljs-number, .hljs-literal) { color: var(--hl-number); }
+.markdown pre :is(.hljs-title, .hljs-section) { color: var(--hl-title); }
+.markdown pre :is(.hljs-built_in, .hljs-type, .hljs-title.class_) { color: var(--hl-type); }
+.markdown pre :is(.hljs-attr, .hljs-attribute, .hljs-property, .hljs-selector-class, .hljs-selector-id) { color: var(--hl-attr); }
+.markdown pre :is(.hljs-meta, .hljs-bullet) { color: var(--hl-meta); }
+.markdown pre :is(.hljs-variable, .hljs-template-variable, .hljs-deletion) { color: var(--hl-variable); }
+.markdown pre .hljs-emphasis { font-style: italic; }
+.markdown pre .hljs-strong { font-weight: 700; }
+
+/* Math (KaTeX). Displayed formulas scroll sideways rather than overflow the reply */
+.markdown .math-block { margin: 0 0 1em; }
+.markdown .katex-display {
+  margin: 0.4em 0;
+  padding: 0.2em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.markdown .katex { font-size: 1.1em; }
+
+/* TeX source shown for the moment KaTeX takes to load */
+.math-pending { font-family: var(--mono); font-size: 0.92em; }
+
 .markdown blockquote {
   border-left: 3px solid var(--fg-muted);
   padding-left: 12px;
@@ -941,6 +978,9 @@ svg {
   font-size: 12px;
 }
 
+.load-options .button-row { margin-top: 4px; }
+.load-options .button-row button { padding: 3px 10px; font-size: 12.5px; }
+
 .button-row {
   display: flex;
   gap: 8px;
@@ -1166,7 +1206,21 @@ dialog h2 {
 
 /* ---- Narrow screens: sidebars become drawers ---- */
 
-.only-narrow, .only-medium { display: none; }
+/* The side panel toggles sit at either end of the top bar (after anything a
+   theme adds there). On wide screens they hide and show the columns */
+#topbar .panel-toggle[data-drawer="sidebar"] { order: -1; }
+#topbar .panel-toggle[data-drawer="panel"] { order: 1; }
+
+@media (min-width: 761px) {
+  .sidebar-hidden #sidebar { display: none; }
+}
+
+@media (min-width: 1101px) {
+  .panel-hidden #panel { display: none; }
+  .sidebar-hidden #app { grid-template-columns: minmax(0, 1fr) 320px; }
+  .panel-hidden #app { grid-template-columns: 260px minmax(0, 1fr); }
+  .sidebar-hidden.panel-hidden #app { grid-template-columns: minmax(0, 1fr); }
+}
 
 #scrim {
   position: fixed;
@@ -1177,7 +1231,7 @@ dialog h2 {
 
 @media (max-width: 1100px) {
   #app { grid-template-columns: 260px minmax(0, 1fr); }
-  .only-medium { display: inline-grid; }
+  .sidebar-hidden #app { grid-template-columns: minmax(0, 1fr); }
 
   .drawer-right {
     position: fixed;
@@ -1195,7 +1249,6 @@ dialog h2 {
 
 @media (max-width: 760px) {
   #app { grid-template-columns: minmax(0, 1fr); }
-  .only-narrow { display: inline-grid; }
 
   .drawer-left {
     position: fixed;

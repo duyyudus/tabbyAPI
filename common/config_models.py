@@ -259,6 +259,13 @@ class ModelConfig(BaseConfigModel):
             f"The legacy values {str(CACHE_SIZES)[15:-1]} are also accepted."
         ),
     )
+    recurrent_state_fp32: Optional[bool] = Field(
+        False,
+        description=(
+            "Store GatedDeltaNet/KDA recurrent state in FP32 instead of FP16. "
+            "Uses twice the state and checkpoint memory; scans compute in FP32 either way."
+        ),
+    )
     tensor_parallel: Optional[bool] = Field(
         False,
         description=(
@@ -679,6 +686,19 @@ class DraftModelConfig(BaseConfigModel):
             "Adjust number of draft tokens dynamically based on observed acceptance rates.\n"
             "Ceiling is given by num_draft_tokens."
         ),
+    )
+    draft_confidence: Optional[float] = Field(
+        0.4,
+        description=(
+            "Target acceptance probability for drafted positions when dynamic_draft is "
+            "enabled (default: 0.4).\n"
+            "Evaluated against an online mapping from drafter confidence scores to "
+            "observed acceptance rates.\n"
+            "Lower values keep longer drafts; higher values truncate more aggressively.\n"
+            "Must be between 0 and 1. Ignored for n-gram drafting."
+        ),
+        gt=0,
+        lt=1,
     )
     ngram_match_min: Optional[int] = Field(
         2,

@@ -1,4 +1,5 @@
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass
 import gc
 import pathlib
@@ -61,6 +62,17 @@ from endpoints.OAI.utils.tools import (
     detect_tool_format,
     is_supported_format,
 )
+
+
+# Recent prompt encodings kept per container. The same text is routinely
+# encoded twice in a row: a streaming request measures its prompt before the
+# response commits to HTTP 200 and then encodes it again for the job, and clients
+# commonly measure a context with /v1/token/encode before sending it. At about
+# a microsecond per token that is half a second twice over for a 500k-token
+# prompt, against a few milliseconds of engine work when the pages are cached.
+# An entry holds the prompt text and its ids (8 bytes per token), so the cache
+# tops out around 100 MB with twenty 500k-token prompts
+ENCODE_CACHE_ENTRIES = 20
 
 
 def _merge_stream_results(results: List[dict]) -> dict:
@@ -241,12 +253,14 @@ class ExllamaV3Container:
     max_seq_len: int = 4096
     cache_size: int = 4096
     cache_mode: str = "FP16"
+    recurrent_state_fp32: bool = False
     draft_cache_mode: str = "FP16"
     chunk_size: int = 2048
     max_rq_tokens: Optional[int] = 2048
     max_batch_size: Optional[int] = None
     draft_num_tokens: Optional[int] = None
     dynamic_draft: Optional[bool] = False
+    draft_confidence: float = 0.4
     ngram_match_min: int = 0
     hybrid_draft_tokens: int = 0
     recurrent_checkpoint_interval: Optional[int] = None
@@ -263,6 +277,7 @@ class ExllamaV3Container:
         self.load_lock = asyncio.Lock()
         self.load_condition = asyncio.Condition()
         self.autosplit_reserve = [96 / 1024]
+        self.encode_cache = OrderedDict()
 
     # Required methods
     @classmethod
@@ -295,7 +310,7 @@ class ExllamaV3Container:
         self = cls()
 
         # Make sure ExllamaV3 is up to date
-        check_package_version("exllamav3", "1.6.1")
+        check_package_version("exllamav3", "1.6.2")
 
         self.model_dir = model_directory
         self.hf_model = hf_model
@@ -406,6 +421,9 @@ class ExllamaV3Container:
             else None
         )
         self.dynamic_draft = draft_args.get("dynamic_draft", False)
+        self.draft_confidence = unwrap(draft_args.get("draft_confidence"), 0.4)
+        if not 0.0 < self.draft_confidence < 1.0:
+            raise ValueError("draft_confidence must be between 0 and 1")
 
         # Long suffix-match drafting on top of whichever drafting mode is
         # active, or on its own: a job repeating its own context verbatim gets
@@ -594,6 +612,8 @@ class ExllamaV3Container:
         # Create cache
         cache_mode_default = "FP16"
         self.cache_mode = unwrap(kwargs.get("cache_mode"), cache_mode_default)
+        self.recurrent_state_fp32 = unwrap(kwargs.get("recurrent_state_fp32"), False)
+        xlogger.info(f"Recurrent state storage: {'fp32' if self.recurrent_state_fp32 else 'fp16'}")
         self.cache = self.create_cache(self.cache_mode, self.model)
 
         # Draft cache
@@ -888,6 +908,7 @@ class ExllamaV3Container:
         batch_draft_args = {
             "max_batch_size": self.max_batch_size,
             "max_history": max(draft_tokens, self.hybrid_draft_tokens),
+            "recurrent_dtype": torch.float if self.recurrent_state_fp32 else torch.half,
         }
 
         if split_cache_mode:
@@ -935,6 +956,7 @@ class ExllamaV3Container:
             id=self.model_dir.name,
             parameters=model_params,
             meta=read_model_meta(self.model_dir, n_ctx=self.max_seq_len, include_size=True),
+            max_model_len=self.max_seq_len,
         )
 
         return model_card
@@ -1209,6 +1231,7 @@ class ExllamaV3Container:
                 cpu_cache_size=config.memory.sysmem_kv_cache * 1024**2,
                 num_draft_tokens=self.draft_num_tokens,
                 dynamic_draft_tokens=self.dynamic_draft,
+                draft_confidence=self.draft_confidence,
                 ngram_match_min=self.ngram_match_min,
                 hybrid_draft_tokens=self.hybrid_draft_tokens,
                 **checkpoint_kwargs,
@@ -1326,6 +1349,52 @@ class ExllamaV3Container:
         token = self.tokenizer.tokenizer.get_added_tokens_decoder().get(bos_id)
         return bos_id if token is not None and token.special else None
 
+    def encode_prompt(
+        self,
+        text: str,
+        add_bos: bool,
+        encode_special_tokens: bool = True,
+        embeddings: Optional[list] = None,
+    ) -> torch.Tensor:
+        """
+        Token IDs for a prompt as a (1, n) tensor, from the encode cache when the
+        same text was encoded recently with the same options. The tensor is
+        shared between callers and must not be modified in place (the engine
+        copies it into the job's own buffer). Prompts with multimodal
+        embeddings are never cached: their placeholder IDs belong to the
+        embeddings passed in.
+        """
+
+        if embeddings:
+            return self.tokenizer.encode(
+                text,
+                add_bos=add_bos,
+                encode_special_tokens=encode_special_tokens,
+                embeddings=embeddings,
+            )
+
+        # Containers are also built without __init__ in places
+        cache = getattr(self, "encode_cache", None)
+        if cache is None:
+            cache = self.encode_cache = OrderedDict()
+
+        key = (text, bool(add_bos), bool(encode_special_tokens))
+        ids = cache.get(key)
+        if ids is not None:
+            cache.move_to_end(key)
+            return ids
+
+        ids = self.tokenizer.encode(
+            text,
+            add_bos=add_bos,
+            encode_special_tokens=encode_special_tokens,
+            embeddings=[],
+        )
+        cache[key] = ids
+        while len(cache) > ENCODE_CACHE_ENTRIES:
+            cache.popitem(last=False)
+        return ids
+
     def encode_tokens(self, text: str, **kwargs) -> List[int]:
         """
         Encodes a string of text into a list of token IDs.
@@ -1345,7 +1414,7 @@ class ExllamaV3Container:
         add_bos_token = unwrap(kwargs.get("add_bos_token"), self.hf_model.add_bos_token())
 
         return (
-            self.tokenizer.encode(
+            self.encode_prompt(
                 text,
                 add_bos=add_bos_token and self.bos_token_id is not None,
                 encode_special_tokens=unwrap(kwargs.get("encode_special_tokens"), True),
@@ -1400,30 +1469,18 @@ class ExllamaV3Container:
         params: BaseSamplerRequest,
         mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
     ):
-        context_len = len(
-            self.encode_tokens(
-                prompt,
-                add_bos_token=unwrap(params.add_bos_token, self.hf_model.add_bos_token()),
-                embeddings=mm_embeddings,
-            )
-        )
-        max_tokens = unwrap(params.max_tokens, 0)
-        if max_tokens <= 0:
-            max_tokens = self.max_seq_len - context_len - 1
-
-        generator = self.generator.generator
-        allocation_boundary = (
-            generator.recurrent_checkpoint_interval
-            if generator.recurrent_cache is not None
-            else 256
-        )
+        # Only the count is needed, and the encoding is reused by the job
+        add_bos_token = unwrap(params.add_bos_token, self.hf_model.add_bos_token())
+        context_len = self.encode_prompt(
+            prompt,
+            add_bos=add_bos_token and self.bos_token_id is not None,
+            embeddings=mm_embeddings.content if mm_embeddings else [],
+        ).numel()
         validate_context_requirements(
             context_len,
             self.max_seq_len,
-            max_tokens,
             self.cache.max_num_tokens,
-            self.job_max_rq_tokens(max_tokens),
-            allocation_boundary,
+            self.generator.generator.max_draft_tokens,
         )
 
     async def generate(
@@ -1902,7 +1959,7 @@ class ExllamaV3Container:
         stop_conditions = list(set(stop_conditions))
 
         input_ids = [
-            self.tokenizer.encode(
+            self.encode_prompt(
                 prompt,
                 add_bos=add_bos_token,
                 encode_special_tokens=True,
@@ -1920,21 +1977,14 @@ class ExllamaV3Container:
         if max_tokens <= 0:
             max_tokens = self.max_seq_len - context_len - 1
 
-        # Validate the initial job before the generator's page-allocation assertion
+        # Validate the prompt before the generator's page-allocation assertion; the
+        # engine caps the response at the room left in the cache
         max_rq_tokens = self.job_max_rq_tokens(max_tokens)
-        generator = self.generator.generator
-        allocation_boundary = (
-            generator.recurrent_checkpoint_interval
-            if generator.recurrent_cache is not None
-            else 256
-        )
         validate_context_requirements(
             context_len,
             self.max_seq_len,
-            max_tokens,
             self.cache.max_num_tokens,
-            max_rq_tokens,
-            allocation_boundary,
+            self.generator.generator.max_draft_tokens,
         )
 
         # Log prompt to console. Add the BOS token if specified
@@ -2048,23 +2098,36 @@ class ExllamaV3Container:
         in_reasoning = phases is not None and phases.reasoning
 
         generation = {}
-        job = AsyncJob(
-            self.generator,
-            sampler=reasoning_sampler if in_reasoning else sampler,
-            input_ids=input_ids,
-            max_new_tokens=max_tokens,
-            min_new_tokens=unwrap(params.min_tokens, 0),
-            token_healing=unwrap(params.token_healing, False),
-            decode_special_tokens=True,
-            stop_conditions=stop_conditions,
-            banned_strings=reasoning_banned if in_reasoning else content_banned,
-            embeddings=mm_embeddings_content,
-            return_top_tokens=params.top_logprobs,
-            return_probs=bool(params.logprobs) or bool(params.top_logprobs),
-            max_rq_tokens=max_rq_tokens,
-            stop_on_loop=params.get_stop_on_loop(),
-            filters=([] if in_reasoning and not phases.engine_trigger else grammar_handler.filters),
-        )
+        try:
+            job = AsyncJob(
+                self.generator,
+                sampler=reasoning_sampler if in_reasoning else sampler,
+                input_ids=input_ids,
+                max_new_tokens=max_tokens,
+                min_new_tokens=unwrap(params.min_tokens, 0),
+                token_healing=unwrap(params.token_healing, False),
+                decode_special_tokens=True,
+                stop_conditions=stop_conditions,
+                banned_strings=reasoning_banned if in_reasoning else content_banned,
+                embeddings=mm_embeddings_content,
+                return_top_tokens=params.top_logprobs,
+                return_probs=bool(params.logprobs) or bool(params.top_logprobs),
+                max_rq_tokens=max_rq_tokens,
+                stop_on_loop=params.get_stop_on_loop(),
+                filters=(
+                    [] if in_reasoning and not phases.engine_trigger else grammar_handler.filters
+                ),
+            )
+        except AssertionError as ex:
+            # The engine's own page check; the preflight above mirrors it, but a request
+            # it misses must still reach the client as a context-length error and not
+            # as a generic failure
+            if "cannot be enqueued" not in str(ex):
+                raise
+            raise ContextLengthExceededError(
+                f"{ex}. The request exceeds the available context size "
+                "(this model's maximum context length)."
+            ) from ex
         self.active_job_ids[request_id] = job
         if phases is not None:
             phases.job = job
