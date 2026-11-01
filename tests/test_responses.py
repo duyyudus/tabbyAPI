@@ -1250,12 +1250,16 @@ class AdditionalContractTests(unittest.IsolatedAsyncioTestCase):
         import importlib.util
         import sys
 
-        fake_exl = SimpleNamespace(Tokenizer=object, Filter=object, LLGuidanceFilter=None)
+        fake_exl = SimpleNamespace(Tokenizer=object, Filter=object, LLGuidanceFilter=object)
+        fake_filter = SimpleNamespace(FJ_PASS=0)
         spec = importlib.util.spec_from_file_location(
             "grammar_under_test", "backends/exllamav3/grammar.py"
         )
         grammar = importlib.util.module_from_spec(spec)
-        with patch.dict(sys.modules, {"exllamav3": fake_exl}):
+        with patch.dict(
+            sys.modules,
+            {"exllamav3": fake_exl, "exllamav3.generator.filter.filter": fake_filter},
+        ):
             spec.loader.exec_module(grammar)
 
         def fail(*args, **kwargs):
