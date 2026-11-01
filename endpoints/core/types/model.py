@@ -117,6 +117,8 @@ class DraftModelLoadRequest(_WarnOnUnknownFields):
     )
     ngram_match_min: Optional[int] = None
     hybrid_draft_tokens: Optional[int] = None
+    draft_max_rows: Optional[int] = None
+    sparse_draft_head: Optional[int] = None
     draft_rope_scale: Optional[float] = None
     draft_rope_alpha: Optional[Union[float, Literal["auto"]]] = Field(
         description='Automatically calculated if set to "auto"',
@@ -234,6 +236,15 @@ class ModelLoadRequest(_WarnOnUnknownFields):
     # Non-config arguments
     draft_model: Optional[DraftModelLoadRequest] = None
     skip_queue: Optional[bool] = False
+    inherit_defaults: Optional[bool] = Field(
+        default=True,
+        description=(
+            "Fill in options the request leaves out from the model folder's "
+            "tabby_config.yml and config.yml's use_as_default keys. With false, "
+            "the request is the complete set of options and anything it leaves "
+            "out gets the backend default"
+        ),
+    )
 
 
 class ModelLoadConfigResponse(BaseModel):

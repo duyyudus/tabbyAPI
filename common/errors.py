@@ -6,11 +6,23 @@ class ContextLengthExceededError(ValueError):
     """Raised when a tokenized prompt exceeds the loaded model's context limit."""
 
 
+class EmptyPromptError(ValueError):
+    """The prompt encodes to no tokens at all, leaving nothing to generate from."""
+
+
 class GrammarParseError(ValueError):
     """Raised when a requested json_schema, regex, or grammar fails to compile.
 
     Constrained decoding refuses to fall back to unconstrained generation, so
     the request is rejected instead of silently served without the constraint.
+    """
+
+
+class LoopDetectedError(RuntimeError):
+    """Raised when loop detection ends a generation whose request set loop_detect_error.
+
+    The output so far is the model repeating itself, so the request fails with a
+    server error the client can retry, instead of returning it as a response.
     """
 
 
@@ -42,6 +54,38 @@ async def context_length_exception_handler(
     return JSONResponse(
         status_code=exc.status_code,
         content=context_length_error_content(exc.detail),
+    )
+
+
+class LoopDetectedHTTPException(HTTPException):
+    """HTTP error for a generation that loop detection stopped, with loop_detect_error set."""
+
+    def __init__(self, message: str):
+        super().__init__(status_code=500, detail=message)
+
+
+def loop_detected_error_content(message: str) -> dict:
+    """
+    Build an OpenAI-style server error for a detected loop. A 500 is what the
+    OpenAI SDKs and most eval harnesses retry on their own.
+    """
+
+    return {
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "param": None,
+            "code": "loop_detected",
+        }
+    }
+
+
+async def loop_detected_exception_handler(
+    request: Request, exc: LoopDetectedHTTPException
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=loop_detected_error_content(exc.detail),
     )
 
 

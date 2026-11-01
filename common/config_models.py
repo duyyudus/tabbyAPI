@@ -109,9 +109,10 @@ class NetworkConfig(BaseConfigModel):
     web_ui: Optional[bool] = Field(
         True,
         description=(
-            "Serve the built-in chat client at /ui (default: True).\n"
-            "A static page for testing models and settings; it only uses the\n"
-            "regular API, so it does nothing until a browser opens it."
+            "Serve the built-in chat client at /ui and the status page at\n"
+            "/ui/status (default: True). Static pages for testing models and\n"
+            "settings, loading models and watching the server; they only use\n"
+            "the regular API, so they do nothing until a browser opens them."
         ),
     )
 
@@ -154,6 +155,15 @@ class LoggingConfig(BaseConfigModel):
         description=(
             "Prefix console log lines with the time of day (default: True).\n"
             "The log files under logs/ always carry full timestamps."
+        ),
+    )
+    log_auth_keys: Optional[bool] = Field(
+        True,
+        description=(
+            "Print the API and admin keys to the console at startup (default: True).\n"
+            "Set to False to log only how many keys api_tokens.yml holds, for consoles\n"
+            "or log files that others can read. The web UI links printed at startup\n"
+            "then leave out the admin key as well."
         ),
     )
     log_chat_completion_requests: Optional[bool] = Field(
@@ -715,6 +725,28 @@ class DraftModelConfig(BaseConfigModel):
             "tokens of the earlier continuation in one verification pass (default: 0,\n"
             "off). Works on top of any draft mode, or on its own. Longer values advance\n"
             "more tokens at prefill speed on a hit, and cost a wider verification pass."
+        ),
+        ge=0,
+    )
+    draft_max_rows: Optional[int] = Field(
+        0,
+        description=(
+            "Ceiling on the decoding rows of a speculative round, batch size times\n"
+            "(1 + draft tokens) (default: 0, no ceiling). The draft window shrinks as\n"
+            "the batch grows so that verifying drafts doesn't cost more than drafting\n"
+            "saves at high concurrency."
+        ),
+        ge=0,
+    )
+    sparse_draft_head: Optional[int] = Field(
+        0,
+        description=(
+            "Draft through a dynamic sparse LM head of this many vocabulary columns\n"
+            "(default: 0, full head). Cuts draft latency for MTP and DFlash drafters,\n"
+            "which share the target's head; verification keeps the full head so output\n"
+            "is unaffected. The column set follows the token frequencies seen in\n"
+            "prompts and generations, saved per tokenizer under the user cache\n"
+            "directory. Layer-split loads only; ignored with tensor parallelism."
         ),
         ge=0,
     )
