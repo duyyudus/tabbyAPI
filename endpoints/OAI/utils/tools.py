@@ -1,9 +1,11 @@
 """Tool call processing utilities for OAI server."""
 
 import ast
+import inspect
 import json
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, List, Optional
 
 from common.logger import xlogger
@@ -240,16 +242,45 @@ def detect_reasoning_tags(
     return None, None
 
 
-def parse_toolcalls(tool_calls_str: str, tool_format: str, strict: bool = False) -> List[ToolCall]:
+def supports_delta_streaming(tool_format: str) -> bool:
+    """
+    True for formats with an incremental delta streamer (see toolcall_stream).
+    These formats can stream partial tool_calls argument deltas instead of
+    one complete delta at end of stream.
+    """
+
+    # Imported here: toolcall_stream imports this module
+    from endpoints.OAI.utils.toolcall_stream import DELTA_STREAMERS
+
+    return canonical_format_name(tool_format) in DELTA_STREAMERS
+
+
+@lru_cache(maxsize=None)
+def _accepts_param_types(parser) -> bool:
+    return "param_types" in inspect.signature(parser.parse_toolcalls).parameters
+
+
+def parse_toolcalls(
+    tool_calls_str: str,
+    tool_format: str,
+    param_types: Optional[dict] = None,
+    strict: bool = False,
+) -> List[ToolCall]:
     """
     Dispatch tool call parsing to the appropriate format handler.
 
     Args:
         tool_calls_str: Raw tool call text from model generation.
         tool_format: See below
+        param_types: Declared parameter types from the request's tools
+            (common.param_types_from_tools), for formats whose values are
+            untyped text. Ignored by formats that don't take them.
+        strict: Raise on a missing parser, parse error or incomplete call
+            instead of returning an empty list.
 
     Returns:
-        List of parsed ToolCall objects. Empty list on parse failure (never raises).
+        List of parsed ToolCall objects. Empty list on parse failure (raises only
+        when strict).
     """
 
     try:
@@ -259,7 +290,10 @@ def parse_toolcalls(tool_calls_str: str, tool_format: str, strict: bool = False)
                 raise ValueError("No tool parser configured")
             return []
 
-        calls = parser.parse_toolcalls(tool_calls_str)
+        if param_types is not None and _accepts_param_types(parser):
+            calls = parser.parse_toolcalls(tool_calls_str, param_types=param_types)
+        else:
+            calls = parser.parse_toolcalls(tool_calls_str)
         if strict:
             _validate_complete_calls(tool_calls_str, parser, calls)
         return calls

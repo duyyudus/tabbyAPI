@@ -1051,7 +1051,9 @@ async function buildMessages(s) {
     // Skip failed or stopped-before-output turns
     if (m.role === "assistant" && !m.content) continue;
     if (!m.images?.length) {
-      messages.push({ role: m.role, content: m.content });
+      // Send the assistant's reasoning back with its turn ("preserve thinking"),
+      // so the model sees the full prior turn, not just the final answer
+      messages.push({ role: m.role, content: m.content, ...(m.reasoning ? { reasoning_content: m.reasoning } : {}) });
       continue;
     }
 
@@ -1679,7 +1681,7 @@ async function convertToNotebook(id) {
   for (const m of chat.messages) {
     if (m.role === "assistant" && !m.content) continue;
     images += m.images?.length || 0;
-    messages.push({ role: m.role, content: m.content });
+    messages.push({ role: m.role, content: m.content, ...(m.reasoning ? { reasoning_content: m.reasoning } : {}) });
   }
   if (!messages.length) {
     setStatus("This chat has nothing to convert yet.");

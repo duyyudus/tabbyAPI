@@ -97,6 +97,15 @@ class NetworkConfig(BaseConfigModel):
         ),
         ge=0,
     )
+    enable_metrics: Optional[bool] = Field(
+        False,
+        description=(
+            "Enable the Prometheus-compatible /metrics endpoint (default: False).\n"
+            "Exposes aggregate inference stats in the text exposition format,\n"
+            "with the same names as llama.cpp's under a tabbyapi: prefix.\n"
+            "Requires an API key unless disable_auth is set."
+        ),
+    )
     access_log: Optional[bool] = Field(
         False,
         description=(
@@ -683,7 +692,9 @@ class DraftModelConfig(BaseConfigModel):
         default_factory=list,
         description=(
             "Array of VRAM sizes to split between GPUs, in GB (default: []).\n"
-            "If this isn't filled in, the draft model is autosplit."
+            "If this isn't filled in, the draft model is autosplit.\n"
+            "Ignored for draft models that load alongside their target model\n"
+            "(e.g. Gemma4 assistant drafters), which follow the target's split."
         ),
     )
     draft_num_tokens: Optional[int] = Field(

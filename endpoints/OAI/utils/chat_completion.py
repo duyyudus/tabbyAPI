@@ -52,6 +52,8 @@ from endpoints.OAI.utils.tools import (
     get_toolcall_tags,
     parse_toolcalls,
 )
+from endpoints.OAI.utils.toolcall_formats.common import param_types_from_tools
+from endpoints.OAI.utils.toolcall_stream import make_delta_streamer
 from endpoints.OAI.utils.common_ import aggregate_usage_stats, get_timings, get_usage_stats
 
 
@@ -545,12 +547,23 @@ def _cut_prompt_at_continue_tag(prompt: str, final_message_text: str) -> str:
     return prompt[:tag_loc].rstrip()
 
 
+# What templates call keeping reasoning on turns before the last user message.
+# llama.cpp sets the same four by default.
+PRESERVE_REASONING_VARS = {
+    "preserve_thinking": True,
+    "clear_thinking": False,
+    "truncate_history_thinking": False,
+    "drop_thinking": False,
+}
+
+
 def resolve_template_vars(data: ChatCompletionRequest, container) -> dict:
     """
     Merge chat template variables from all sources. Priority, lowest to
-    highest: the model's template_vars_default, the request's reasoning
-    object, the request's flat reasoning_effort/enable_thinking/verbosity
-    fields, the request's template_vars, then the model's template_vars_force.
+    highest: PRESERVE_REASONING_VARS if there's reasoning to preserve, the
+    model's template_vars_default, the request's reasoning object, the
+    request's flat reasoning_effort/enable_thinking/verbosity fields, the
+    request's template_vars, then the model's template_vars_force.
     """
 
     request_vars = {}
@@ -573,7 +586,12 @@ def resolve_template_vars(data: ChatCompletionRequest, container) -> dict:
 
     request_vars.update(data.template_vars)
 
+    # With no reasoning to keep, these would only give earlier turns empty
+    # reasoning blocks, as Qwen 3.6's and DeepSeek V4's templates do
+    has_reasoning = any(message.reasoning_content for message in data.messages)
+
     return {
+        **(PRESERVE_REASONING_VARS if has_reasoning else {}),
         **container.template_vars_default,
         **request_vars,
         **container.template_vars_force,
@@ -680,16 +698,17 @@ def _parse_tool_calls(
     text: str,
     tool_format: str,
     label: str,
+    param_types: Optional[dict] = None,
 ) -> list:
     """
     Parse collected tool calls and convert to OAI format.
 
     Insert tool indices as well. (These are not choice indices; OAI enumerates the tool
-    calls within each individual choice for the sake of streaming incomplete tool arg
-    deltas, which we don't do here.)
+    calls within each individual choice, and the delta streamer numbers them the same way.)
+    param_types carries the parameter types declared by the request's tools.
     """
 
-    parsed = parse_toolcalls(text, tool_format)
+    parsed = parse_toolcalls(text, tool_format, param_types)
     for tc_idx, p in enumerate(parsed):
         p.index = tc_idx
     dumped = [p.model_dump(mode="json") for p in parsed]
@@ -770,11 +789,13 @@ async def iter_generation_events(
         # reasoning and tool format settings
         tool_format = "harmony"
         use_think = False
+        use_tool = False
         parser = HarmonyStreamParser(initial_channel)
     elif mc.muse_glimmer:
         # Same for Muse Glimmer, with recipients in place of channels
         tool_format = "muse_glimmer"
         use_think = False
+        use_tool = False
         parser = GlimmerStreamParser(initial_channel)
     else:
         tool_format = mc.tool_format
@@ -886,6 +907,7 @@ async def iter_generation_events(
                 "generation": generation,
                 "events": events,
                 "tool_format": tool_format,
+                "use_tool": use_tool,
                 "content_logprobs": not parser.saw_tag and parser.in_content,
             }
             if finish_reason:
@@ -929,6 +951,19 @@ async def _chat_stream_collector(
     # Collect logprobs
     collected_logprobs = []
 
+    # Parameter types declared by the request's tools: a string parameter is
+    # never reinterpreted as a JSON literal, and the delta streamer can emit it
+    # as it is generated
+    param_types = param_types_from_tools(params.tools)
+
+    # Incremental tool_calls deltas: for formats that support it, emit
+    # OpenAI-style tool call fragments as they are generated instead of one
+    # complete delta at end of stream. The end-of-stream parse stays as the
+    # fallback whenever the streamer produced nothing. Created on the first
+    # packet, once the active tool format is known.
+    tool_streamer = None
+    streamer_ready = False
+
     source = iter_generation_events(
         request_id,
         prompt,
@@ -954,8 +989,14 @@ async def _chat_stream_collector(
             events = packet["events"]
             tool_format = packet["tool_format"]
 
+            if not streamer_ready:
+                streamer_ready = True
+                if streaming_mode and packet["use_tool"]:
+                    tool_streamer = make_delta_streamer(tool_format, param_types)
+
             delta_reasoning = ""
             delta_content = ""
+            tool_deltas: list = []
             for channel, sub in events:
                 if channel == REASONING:
                     delta_reasoning += sub
@@ -965,6 +1006,8 @@ async def _chat_stream_collector(
                     full_content += sub
                 else:
                     full_tool += sub
+                    if tool_streamer is not None:
+                        tool_deltas.extend(tool_streamer.feed(sub))
 
             # Collect logprobs in content span only, skipping chunks that
             # contain a phase transition
@@ -993,10 +1036,23 @@ async def _chat_stream_collector(
                 generation["delta_reasoning_content"] = delta_reasoning
                 generation["delta_content"] = delta_content
                 generation["delta_tool_calls"] = ""
+                if tool_deltas:
+                    await gen_queue.put({"index": task_idx, "delta_tool_calls": tool_deltas})
                 if finish_reason and full_tool:
-                    generation["delta_tool_calls"] = _parse_tool_calls(
-                        full_tool, tool_format, label
-                    )
+                    if tool_streamer is not None and tool_streamer.emitted:
+                        # Fragments were streamed; the client assembles the
+                        # calls itself, so only cross-check against the
+                        # authoritative parse and close the finish reason.
+                        tool_streamer.verify(full_tool, label)
+                        names = tool_streamer.names
+                        xlogger.info(
+                            f"{label}: streamed {len(names)} tool call"
+                            f"{'' if len(names) == 1 else 's'} ({tool_format}): " + ", ".join(names)
+                        )
+                    else:
+                        generation["delta_tool_calls"] = _parse_tool_calls(
+                            full_tool, tool_format, label, param_types
+                        )
                     generation["finish_reason"] = "tool_calls"
                 await gen_queue.put(generation)
 
@@ -1011,7 +1067,7 @@ async def _chat_stream_collector(
                 generation["logprob_response"] = ChatCompletionLogprobs(content=collected_logprobs)
             generation["reasoning_content"] = full_reasoning
             generation["content"] = full_content if has_content else None
-            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, label)
+            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, label, param_types)
             if full_tool:
                 generation["finish_reason"] = "tool_calls"
             return generation
