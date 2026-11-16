@@ -35,7 +35,7 @@ from backends.exllamav3.sampler import (
     SS_HealedCandidates,
     SS_OnlyPath,
 )
-from backends.exllamav3.utils import exllama_supports_nccl
+from backends.exllamav3.utils import cap_host_torch_threads, exllama_supports_nccl
 from backends.exllamav3.vision import clear_image_embedding_cache, image_embedding_cache
 from common.concurrency import iterate_in_threadpool
 from common.gen_logging import (
@@ -278,6 +278,7 @@ class ExllamaV3Container:
     gpu_split: Optional[List[float]] = None
     gpu_split_auto: bool = True
     draft_gpu_split: Optional[List[float]] = None
+    host_torch_threads: Optional[int] = None
     autosplit_reserve: Optional[List[float]]
     use_tp: bool = False
     tp_backend: str = "native"
@@ -394,6 +395,11 @@ class ExllamaV3Container:
                     "cpu_moe_pinned_arena has no effect without cpu_moe_offload_layers "
                     "or cpu_moe_split_experts."
                 )
+
+        # The engine pins this process to a core or two while its expert worker
+        # runs; keep torch's own thread pool within them (restored on unload)
+        if self.config.infer_params.moe_cpu_offload or self.config.infer_params.moe_cpu_split:
+            self.host_torch_threads = cap_host_torch_threads()
 
         # Load an n-gram embedding table (PLE models) fully into system RAM
         # instead of streaming rows from disk per forward. Must be set before
@@ -1400,6 +1406,11 @@ class ExllamaV3Container:
             if self.use_vision:
                 self.vision_model.unload()
                 self.vision_model = None
+
+            # Give torch its full thread pool back once the CPU MoE worker is gone
+            if self.host_torch_threads is not None:
+                torch.set_num_threads(self.host_torch_threads)
+                self.host_torch_threads = None
 
             gc.collect()
             torch.cuda.empty_cache()
