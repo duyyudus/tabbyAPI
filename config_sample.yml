@@ -571,3 +571,9 @@ developer:
 
   # Seq server API key (default: None)
   seqlog_api_key:
+
+  # Load the exllamav3 Python package from this source checkout instead of the installed one
+  # (default: None). Point it at the directory that contains the exllamav3 package, e.g. a
+  # clone of a patched fork. The installed wheel still provides the compiled extension, so the
+  # checkout must not change C++/CUDA code relative to the installed version.
+  exllamav3_path:

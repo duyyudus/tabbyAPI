@@ -971,6 +971,17 @@ class DeveloperConfig(BaseConfigModel):
         None,
         description=("Seq server API key (default: None)"),
     )
+    exllamav3_path: Optional[str] = Field(
+        None,
+        description=(
+            "Load the exllamav3 Python package from this source checkout instead of the "
+            "installed one (default: None).\n"
+            "Point it at the directory that contains the exllamav3 package, e.g. a clone of a "
+            "patched fork.\n"
+            "The installed wheel still provides the compiled extension, so the checkout must "
+            "not change C++/CUDA code relative to the installed version."
+        ),
+    )
 
 
 class TabbyConfigModel(BaseModel):
