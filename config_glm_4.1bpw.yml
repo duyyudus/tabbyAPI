@@ -533,5 +533,5 @@ developer:
 
   # Load the exllamav3 Python package from this source checkout instead of the installed one
   # (default: None). Here: the fork with pipelined prefill under CPU MoE offload,
-  # https://github.com/duyyudus/exllamav3 (branch ds-pipelined-prefill).
+  # https://github.com/duyyudus/exllamav3 (branch master).
   exllamav3_path: ~/git/exllamav3
