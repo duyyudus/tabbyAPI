@@ -245,7 +245,25 @@ model:
   # models with linear or sliding attention use more VRAM to support larger batches,
   # so the default value is reduced to 4. If you do not require concurrency at all, you
   # can reduce it further to minimize VRAM overhead.
-  max_batch_size: 1
+  # 4 with prefill_priority: concurrent requests start within seconds instead of waiting for
+  # each other's whole answers, at about 19 T/s each when four generate at once. One user
+  # runs exactly as at 1 (docs/13, Concurrent requests). GPU 0 peaks about 0.2 GB higher.
+  max_batch_size: 4
+
+  # Ingest prompts first when requests overlap (default: False).
+  # Requests that are generating pause while a new prompt is ingested, and prompts
+  # are ingested one at a time, shortest first, each getting its first token when
+  # it finishes. Needs the patched ExLlamaV3 (developer.exllamav3_path).
+  prefill_priority: true
+
+  # With prefill_priority: seconds that generating requests can be paused before
+  # they get a turn of decode_slice seconds, plus the time to finish the prompt
+  # chunks in flight (default: 0, paused until no prompt is left).
+  prefill_slice: 8
+
+  # With prefill_priority and prefill_slice: seconds of generation per turn
+  # (default: 2.0).
+  decode_slice: 2.0
 
   # Tokens between recurrent state checkpoints near the end of the prompt and
   # during generation (default: None, the engine's per-architecture default,
@@ -429,7 +447,8 @@ draft_model:
   # Ceiling on the decoding rows of a speculative round, batch size times (1 + draft tokens)
   # (default: 0, no ceiling). The draft window shrinks as the batch grows so that verifying
   # drafts doesn't cost more than drafting saves at high concurrency.
-  draft_max_rows: 0
+  # 8: a window of 3 for two requests, 1 token for three or four
+  draft_max_rows: 8
 
   # Draft through a dynamic sparse LM head of this many vocabulary columns (default: 0, full
   # head). Cuts draft latency for MTP and DFlash drafters, which share the target's head;
