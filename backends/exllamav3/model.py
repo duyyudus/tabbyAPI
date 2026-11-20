@@ -290,6 +290,9 @@ class ExllamaV3Container:
     chunk_size: int = 2048
     max_rq_tokens: Optional[int] = 2048
     max_batch_size: Optional[int] = None
+    prefill_priority: bool = False
+    prefill_slice: float = 0.0
+    decode_slice: float = 2.0
     draft_num_tokens: Optional[int] = None
     dynamic_draft: Optional[bool] = False
     draft_confidence: float = 0.4
@@ -665,6 +668,13 @@ class ExllamaV3Container:
         # Max batch size
         default_mbs = 4 if self.model.caps.get("recurrent_states") else 128
         self.max_batch_size = unwrap(kwargs.get("max_batch_size"), default_mbs)
+
+        # Prompt ingestion first when requests overlap (needs the patched engine)
+        self.prefill_priority = unwrap(kwargs.get("prefill_priority"), False)
+        self.prefill_slice = unwrap(kwargs.get("prefill_slice"), 0.0)
+        self.decode_slice = unwrap(kwargs.get("decode_slice"), 2.0)
+        if self.prefill_slice < 0 or self.decode_slice <= 0:
+            raise ValueError("prefill_slice must be 0 or greater and decode_slice greater than 0")
 
         # Recurrent checkpoint intervals (None = engine defaults)
         self.recurrent_checkpoint_interval = kwargs.get("recurrent_checkpoint_interval")
@@ -1300,6 +1310,16 @@ class ExllamaV3Container:
                     self.recurrent_checkpoint_interval_pp
                 )
 
+            # Prompt ingestion first, only passed when on: the stock engine takes
+            # unknown arguments without complaint
+            schedule_kwargs = {}
+            if self.prefill_priority:
+                schedule_kwargs = {
+                    "prefill_priority": True,
+                    "prefill_slice": self.prefill_slice,
+                    "decode_slice": self.decode_slice,
+                }
+
             # Create new generator
             self.generator = AsyncGenerator(
                 model=self.model,
@@ -1319,6 +1339,7 @@ class ExllamaV3Container:
                 draft_max_rows=self.draft_max_rows,
                 sparse_draft_head=self.sparse_draft_head,
                 **checkpoint_kwargs,
+                **schedule_kwargs,
                 **self.disk_cache_kwargs,
             )
 
@@ -1329,6 +1350,21 @@ class ExllamaV3Container:
             # Report the effective intervals (the engine rounds the ingestion
             # interval up to a multiple of chunk_size)
             generator = self.generator.generator
+            if schedule_kwargs:
+                if not getattr(generator, "prefill_priority", False):
+                    xlogger.warning(
+                        "prefill_priority is not supported by this ExLlamaV3 and is ignored. "
+                        "It needs the patched engine (developer.exllamav3_path)."
+                    )
+                elif self.max_batch_size > 1:
+                    turns = (
+                        f"a {self.decode_slice:g} s turn after {self.prefill_slice:g} s"
+                        if self.prefill_slice
+                        else "no turn until prompts finish"
+                    )
+                    xlogger.info(
+                        f"Prefill priority: generating requests pause for prompts, {turns}."
+                    )
             if checkpoint_kwargs and generator.recurrent_cache is not None:
                 xlogger.info(
                     "Using recurrent checkpoint intervals: "

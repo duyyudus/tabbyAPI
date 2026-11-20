@@ -250,6 +250,26 @@ model:
   # can reduce it further to minimize VRAM overhead.
   max_batch_size:
 
+  # Ingest prompts first when requests overlap (default: False).
+  # Requests that are generating pause while a new prompt is ingested, and prompts
+  # are ingested one at a time, shortest first, each getting its first token when
+  # it finishes. By default a prompt that arrives during generation is ingested in
+  # small slices between generation steps, which suits models that run entirely on
+  # GPUs. With experts offloaded to the CPU or a layer split over slow links, each
+  # slice takes seconds and stops the pipelined prefill, so both requests slow down.
+  # Only matters with max_batch_size above 1. Needs the patched ExLlamaV3
+  # (developer.exllamav3_path).
+  prefill_priority: false
+
+  # With prefill_priority: seconds that generating requests can be paused before
+  # they get a turn of decode_slice seconds, plus the time to finish the prompt
+  # chunks in flight (default: 0, paused until no prompt is left).
+  prefill_slice: 0.0
+
+  # With prefill_priority and prefill_slice: seconds of generation per turn
+  # (default: 2.0).
+  decode_slice: 2.0
+
   # Tokens between recurrent state checkpoints near the end of the prompt and
   # during generation (default: None, the engine's per-architecture default,
   # 2048 for most models). Only used by models with recurrent (linear or sliding

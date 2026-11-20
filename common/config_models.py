@@ -446,6 +446,37 @@ class ModelConfig(BaseConfigModel):
         ),
         ge=1,
     )
+    prefill_priority: Optional[bool] = Field(
+        False,
+        description=(
+            "Ingest prompts first when requests overlap (default: False).\n"
+            "Requests that are generating pause while a new prompt is ingested, and prompts\n"
+            "are ingested one at a time, shortest first, each getting its first token when\n"
+            "it finishes. By default a prompt that arrives during generation is ingested in\n"
+            "small slices between generation steps, which suits models that run entirely on\n"
+            "GPUs. With experts offloaded to the CPU or a layer split over slow links, each\n"
+            "slice takes seconds and stops the pipelined prefill, so both requests slow down.\n"
+            "Only matters with max_batch_size above 1. Needs the patched ExLlamaV3\n"
+            "(developer.exllamav3_path)."
+        ),
+    )
+    prefill_slice: Optional[float] = Field(
+        0.0,
+        description=(
+            "With prefill_priority: seconds that generating requests can be paused before\n"
+            "they get a turn of decode_slice seconds, plus the time to finish the prompt\n"
+            "chunks in flight (default: 0, paused until no prompt is left)."
+        ),
+        ge=0,
+    )
+    decode_slice: Optional[float] = Field(
+        2.0,
+        description=(
+            "With prefill_priority and prefill_slice: seconds of generation per turn\n"
+            "(default: 2.0)."
+        ),
+        gt=0,
+    )
     recurrent_checkpoint_interval: Optional[int] = Field(
         None,
         description=(

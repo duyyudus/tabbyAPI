@@ -198,6 +198,9 @@ class ModelLoadRequest(_WarnOnUnknownFields):
         gt=0,
     )
     max_batch_size: Optional[int] = None
+    prefill_priority: Optional[bool] = None
+    prefill_slice: Optional[float] = Field(default=None, ge=0)
+    decode_slice: Optional[float] = Field(default=None, gt=0)
     prompt_template: Optional[str] = None
     vision: Optional[bool] = None
     vision_offload: Optional[bool] = None
