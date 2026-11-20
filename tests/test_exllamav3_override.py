@@ -60,6 +60,36 @@ def test_other_top_level_names_are_not_redirected(tmp_path):
     assert out == "True"
 
 
+def test_extension_stays_installed_without_inplace_build(tmp_path):
+    root = _make_checkout(tmp_path)
+    # Sources under that name are not a build
+    (root / "exllamav3_ext").mkdir()
+    out = _run(
+        f"""
+        from common.exllamav3_override import extension_origin, use_exllamav3_checkout
+        use_exllamav3_checkout({str(root)!r})
+        print(str(extension_origin()).startswith({str(root)!r}))
+        """
+    )
+    assert out == "False"
+
+
+def test_inplace_build_of_extension_is_used(tmp_path):
+    import importlib.machinery
+
+    root = _make_checkout(tmp_path)
+    built = root / ("exllamav3_ext" + importlib.machinery.EXTENSION_SUFFIXES[0])
+    built.write_bytes(b"")
+    out = _run(
+        f"""
+        from common.exllamav3_override import extension_origin, use_exllamav3_checkout
+        use_exllamav3_checkout({str(root)!r})
+        print(extension_origin())
+        """
+    )
+    assert out == str(built)
+
+
 def test_user_home_is_expanded(tmp_path, monkeypatch):
     root = _make_checkout(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path))

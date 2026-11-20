@@ -978,8 +978,9 @@ class DeveloperConfig(BaseConfigModel):
             "installed one (default: None).\n"
             "Point it at the directory that contains the exllamav3 package, e.g. a clone of a "
             "patched fork.\n"
-            "The installed wheel still provides the compiled extension, so the checkout must "
-            "not change C++/CUDA code relative to the installed version."
+            "The compiled extension comes from the checkout root when it holds an in-place "
+            "build (python setup.py build_ext --inplace), otherwise from the installed wheel, "
+            "in which case the checkout must not change C++/CUDA code relative to it."
         ),
     )
 

@@ -210,13 +210,14 @@ def entrypoint(
 
     # Optionally load exllamav3 from a source checkout. Must happen before anything imports it
     if config.developer.exllamav3_path:
-        from common.exllamav3_override import use_exllamav3_checkout
+        from common.exllamav3_override import extension_origin, use_exllamav3_checkout
 
         try:
             package = use_exllamav3_checkout(config.developer.exllamav3_path)
         except (ValueError, RuntimeError) as e:
             raise SystemExit(f"ERROR: developer.exllamav3_path: {e}") from e
         xlogger.info(f"Using exllamav3 from {package}")
+        xlogger.info(f"Using exllamav3_ext from {extension_origin() or 'nowhere (JIT build)'}")
 
     # branch to default paths if required
     if run_subcommand(args):

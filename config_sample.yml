@@ -574,6 +574,7 @@ developer:
 
   # Load the exllamav3 Python package from this source checkout instead of the installed one
   # (default: None). Point it at the directory that contains the exllamav3 package, e.g. a
-  # clone of a patched fork. The installed wheel still provides the compiled extension, so the
-  # checkout must not change C++/CUDA code relative to the installed version.
+  # clone of a patched fork. The compiled extension comes from the checkout root when it holds an
+  # in-place build (python setup.py build_ext --inplace), otherwise from the installed wheel, in
+  # which case the checkout must not change C++/CUDA code relative to it.
   exllamav3_path:
