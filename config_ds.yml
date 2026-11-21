@@ -168,9 +168,19 @@ model:
 
   # Array of VRAM sizes to split between GPUs, in GB (default: []).
   # Used both with and without tensor parallelism.
-  # 68 (not 70) on GPU 0 leaves it room for 3 or more prefill chunks in flight: launch with
-  # EXL3_DS_PIPELINE_DEPTH=4 (see docs/13.-Performance-Tuning.md, DeepSeek setup)
-  gpu_split: [68,24,24,24,24]
+  # Layout for attn_device: local (below). 22 on GPU 3 moves one layer to GPU 4, so that
+  # every card keeps room for prompts near the full cache (see
+  # docs/13.-Performance-Tuning.md, DeepSeek setup). Pinned attention used [68,24,24,24,24]
+  # with cpu_moe_split_experts 76.
+  gpu_split: [70,24,24,22,24]
+
+  # Where a layer split puts the attention layers of models whose layers share K/V pools,
+  # such as DeepSeek-V4.1 (default: unset, the first GPU of the split). A GPU index pins them
+  # to that GPU. local keeps each attention layer on its own layer's GPU and copies the shared
+  # pools to the GPUs that read them: faster multi-GPU prefill, but more VRAM on those GPUs
+  # (a split may need a higher cpu_moe_split_experts). No effect on other models, one GPU or
+  # tensor parallelism.
+  attn_device: local
 
   # Number of mixture-of-expert layers to offload to CPU inference (default: 0)
   # Only affects MoE models. Set a large value such as 999 to offload all layers
@@ -182,7 +192,7 @@ model:
   # layers: the coldest experts are kept in system RAM and computed on the CPU, overlapping
   # each layer's own GPU compute, with dynamic placement keeping hot experts in VRAM.
   # Mutually exclusive with cpu_moe_offload_layers; not supported with tensor parallelism.
-  cpu_moe_split_experts: 76
+  cpu_moe_split_experts: 88
 
   # Worker thread count for CPU MoE inference (default: None).
   # Applies to both cpu_moe_offload_layers and cpu_moe_split_experts. When unset,
