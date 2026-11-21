@@ -15,6 +15,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Union,
 )
 from exllamav3.constants import PAGE_SIZE
 from exllamav3 import (
@@ -278,6 +279,7 @@ class ExllamaV3Container:
     gpu_split: Optional[List[float]] = None
     gpu_split_auto: bool = True
     draft_gpu_split: Optional[List[float]] = None
+    attn_device: Optional[Union[int, str]] = None
     host_torch_threads: Optional[int] = None
     autosplit_reserve: Optional[List[float]]
     use_tp: bool = False
@@ -545,6 +547,23 @@ class ExllamaV3Container:
         gpu_device_list = list(range(0, gpu_count))
         use_tp = unwrap(kwargs.get("tensor_parallel"), False)
 
+        # Device for the attention layers of models whose layers share K/V pools
+        # (DeepSeek-V4.1): a GPU index, or "local" to keep each one with its layer
+        attn_device = kwargs.get("attn_device")
+        if isinstance(attn_device, str):
+            attn_device = attn_device.strip().lower()
+            if attn_device.isdigit():
+                attn_device = int(attn_device)
+            elif attn_device != "local":
+                raise ValueError(
+                    f'attn_device must be a GPU index or "local", not "{attn_device}".'
+                )
+        self.attn_device = attn_device
+        if attn_device == "local":
+            xlogger.info(
+                "Keeping each attention layer on its own layer's GPU (attn_device: local)."
+            )
+
         # Reserve VRAM per GPU. Read for every split mode
         default_reserve = [96]
         autosplit_reserve_megabytes = unwrap(kwargs.get("autosplit_reserve"), default_reserve)
@@ -573,6 +592,9 @@ class ExllamaV3Container:
 
                 # TP has its own autosplit loader
                 self.gpu_split_auto = False
+
+                if self.attn_device is not None:
+                    xlogger.warning("attn_device only applies to layer splits and is ignored.")
 
                 # The sparse drafting head only exists for layer-split loads
                 if self.sparse_draft_head:
@@ -1254,6 +1276,12 @@ class ExllamaV3Container:
             max_chunk_size=self.chunk_size,
             max_batch_size=self.max_batch_size,
             draft_model=self.draft_model if self.use_draft_model else None,
+            # Only when set, so exllamav3 versions without the parameter still load
+            **(
+                {"attn_device": self.attn_device}
+                if self.attn_device is not None and not self.use_tp
+                else {}
+            ),
         ):
             if value:
                 yield value

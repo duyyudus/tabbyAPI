@@ -304,6 +304,7 @@ LOAD_OPTION_GROUPS = [
             "gpu_split_auto",
             "gpu_split",
             "autosplit_reserve",
+            "attn_device",
             "tensor_parallel",
             "tensor_parallel_backend",
             "layer_map",

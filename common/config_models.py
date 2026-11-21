@@ -327,6 +327,17 @@ class ModelConfig(BaseConfigModel):
             "Used both with and without tensor parallelism."
         ),
     )
+    attn_device: Optional[Union[int, str]] = Field(
+        None,
+        description=(
+            "Where a layer split puts the attention layers of models whose layers\n"
+            "share K/V pools, such as DeepSeek-V4.1 (default: None, the first GPU of\n"
+            "the split). A GPU index pins them to that GPU. local keeps each\n"
+            "attention layer on its own layer's GPU and copies the shared pools to\n"
+            "the GPUs that read them: faster multi-GPU prefill, but more VRAM on\n"
+            "those GPUs. No effect on other models, one GPU or tensor parallelism."
+        ),
+    )
     cpu_moe_offload_layers: Optional[int] = Field(
         0,
         description=(

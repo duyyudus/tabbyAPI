@@ -171,6 +171,7 @@ class ModelLoadRequest(_WarnOnUnknownFields):
         default_factory=list,
         examples=[[24.0, 20.0]],
     )
+    attn_device: Optional[Union[int, str]] = None
     rope_scale: Optional[float] = Field(
         description="Automatically pulled from the model's config if not present",
         default=None,

@@ -175,6 +175,14 @@ model:
   # Used both with and without tensor parallelism.
   gpu_split: []
 
+  # Where a layer split puts the attention layers of models whose layers share K/V pools,
+  # such as DeepSeek-V4.1 (default: unset, the first GPU of the split). A GPU index pins them
+  # to that GPU. local keeps each attention layer on its own layer's GPU and copies the shared
+  # pools to the GPUs that read them: faster multi-GPU prefill, but more VRAM on those GPUs
+  # (a split may need a higher cpu_moe_split_experts). No effect on other models, one GPU or
+  # tensor parallelism.
+  attn_device:
+
   # Number of mixture-of-expert layers to offload to CPU inference (default: 0)
   # Only affects MoE models. Set a large value such as 999 to offload all layers
   # Mutually exclusive with cpu_moe_split_experts.
