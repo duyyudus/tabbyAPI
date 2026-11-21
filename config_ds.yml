@@ -168,8 +168,8 @@ model:
 
   # Array of VRAM sizes to split between GPUs, in GB (default: []).
   # Used both with and without tensor parallelism.
-  # 68 (not 70) on GPU 0 leaves it room for 3 prefill chunks in flight: launch with
-  # EXL3_DS_PIPELINE_DEPTH=3 (see docs/13.-Performance-Tuning.md, DeepSeek setup)
+  # 68 (not 70) on GPU 0 leaves it room for 3 or more prefill chunks in flight: launch with
+  # EXL3_DS_PIPELINE_DEPTH=4 (see docs/13.-Performance-Tuning.md, DeepSeek setup)
   gpu_split: [68,24,24,24,24]
 
   # Number of mixture-of-expert layers to offload to CPU inference (default: 0)
