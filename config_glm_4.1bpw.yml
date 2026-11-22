@@ -424,7 +424,9 @@ draft_model:
   # one verification pass (default: 0, off). Works on top of any draft mode, or on its own.
   # Longer values advance more tokens at prefill speed on a hit, and cost a wider
   # verification pass.
-  hybrid_draft_tokens: 0
+  # 7: the most the draft_max_rows ceiling below allows one request. Decode of code edits and
+  # file rewrites was 29-39% faster (16 was no faster); other output is unaffected.
+  hybrid_draft_tokens: 7
 
   # Ceiling on the decoding rows of a speculative round, batch size times (1 + draft tokens)
   # (default: 0, no ceiling). The draft window shrinks as the batch grows so that verifying
