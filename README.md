@@ -85,6 +85,7 @@ For Docker Compose, custom config mounts, or building the image locally, see the
 - Utilizes modern python paradigms
 - Continuous batching engine using paged attention
 - OAI style tool/function calling
+- Large MoE models split across mixed GPUs with experts offloaded to the CPU (see the [Performance Tuning guide](docs/13.-Performance-Tuning.md))
 
 And much more. If something is missing here, PR it in!
 
@@ -147,3 +148,15 @@ This fork also supports stateless `POST /v1/messages` and `/v1/messages/count_to
 so Claude Code and the Anthropic SDKs can use a local model. See the
 [Anthropic Messages API guide](docs/12.-Anthropic-Messages-API.md) for Claude Code setup
 and supported parameters.
+
+### Multi-GPU with CPU MoE offload
+
+For MoE models too large for your GPUs, this fork and its
+[patched ExLlamaV3](https://github.com/duyyudus/exllamav3) split the layers across several cards
+of different sizes and keep part of each layer's experts on the CPU, with pipelined prefill across
+the GPUs, prefill-first scheduling for concurrent requests, faster decode kernels and drafting of
+passages the reply repeats from its context. The
+[Performance Tuning guide](docs/13.-Performance-Tuning.md) explains the settings, gives measured
+results for DeepSeek-V4.1-Flash and GLM-5.3-Flash on a five-GPU machine, lists what to retune after
+changing GPUs, and describes `tools/tune_gpu_split.py`, which finds `gpu_split` and
+`cpu_moe_split_experts` for your cards.
